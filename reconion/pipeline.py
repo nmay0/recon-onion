@@ -30,6 +30,7 @@ DEFAULT_TOGGLES: dict[str, bool] = {
     "nmap_service": True,
     "whois": True,
     "dig": True,
+    "tls_cert": True,
     "searchsploit": True,
     "gobuster_dir": True,
     "ffuf": False,           # opt-in: enable manually via 'Modify run'
@@ -49,6 +50,8 @@ class HostResult:
     gobuster_hits: dict[str, list[str]] = field(default_factory=dict)
     ffuf_hits: dict[str, list[str]] = field(default_factory=dict)
     exploits: list[dict] = field(default_factory=list)
+    # TLS certs per HTTPS port: {port, cn, sans, issuer, not_after}.
+    tls: list[dict] = field(default_factory=list)
     # nuclei findings, flat across all web ports/vhosts (context on each record).
     findings: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -220,6 +223,47 @@ def run_host(
             result.errors.append(
                 "searchsploit: skipped (needs the nmap service scan — enable it)")
 
+    # ---- Stage 3.5: TLS certificate inspection + SAN discovery -------------
+    # For each HTTPS port, pull the cert and decode it. Concrete SAN hostnames
+    # are auto-offered as vhost candidates for the web stage *only* when the user
+    # didn't specify vhosts themselves (session-only; never persisted to config).
+    vhosts = list(vhosts or [])
+    if toggles.get("tls_cert", True):
+        https_ports = [p for p in open_ports if p.is_https]
+        if https_ports:
+            console.print("\n[bold]▶ TLS certificate inspection[/bold]")
+        discovered_sans: list[str] = []
+        for port in https_ports:
+            res = tools.tls_cert(
+                host, port.number, run_dir / f"tls_cert_{port.number}.txt",
+                extra=tflags.get("tls_cert", ""))
+            _record(res, result.errors)
+            print_tool_block(console, f"tls_cert — :{port.number}", res)
+            result.tool_runs.append(ToolRun(
+                name="tls_cert", title=f"{host}:{port.number}", result=res,
+                kind="tls", port=port.number))
+            if not res.ok:
+                continue
+            parsed = tools.parse_tls_cert(res.grepable)
+            result.tls.append({"port": port.number, **parsed})
+            for san in parsed.get("sans", []):
+                if (san and san != host and san not in vhosts
+                        and san not in discovered_sans):
+                    discovered_sans.append(san)
+        if discovered_sans:
+            console.print(
+                "  [cyan]TLS SANs discovered:[/cyan] "
+                + ", ".join(discovered_sans))
+            if vhosts:
+                console.print(
+                    "  [dim]Virtual hosts already set; not auto-adding SANs. "
+                    "Re-run with them if you want to enumerate them.[/dim]")
+            else:
+                vhosts = discovered_sans
+                console.print(
+                    "  [green]Auto-adding discovered SANs as virtual hosts "
+                    "for this run.[/green]")
+
     # ---- Stage 4: web tools, per detected web port -------------------------
     web_ports = [p for p in open_ports if p.is_web]
     if web_ports:
@@ -241,7 +285,7 @@ def run_host(
     print_summary(console, host, run_dir, result.ports, result.gobuster_hits,
                   result.errors, ffuf_hits=result.ffuf_hits,
                   exploits=result.exploits, findings=result.findings,
-                  dns_map=dns_map)
+                  dns_map=dns_map, tls=result.tls)
 
     # ---- Consolidated reports (formats chosen in config) -------------------
     document = report.build_document(

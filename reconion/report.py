@@ -30,6 +30,7 @@ from .tools import (
     parse_gobuster_hits,
     parse_nuclei,
     parse_searchsploit,
+    parse_tls_cert,
 )
 
 SCHEMA_VERSION = 1
@@ -141,8 +142,15 @@ def build_document(
     discovery: dict[str, list[str]] = {"vhost": [], "dns": []}
     exploits: list[dict[str, str]] = []
     findings: list[dict[str, Any]] = []
+    tls: list[dict[str, Any]] = []
     for tr in tool_runs:
         out = tr.result.stdout or ""
+        if tr.kind == "tls":
+            # SAN/CN/issuer/expiry are parsed from the JSON content stored in
+            # ToolResult.grepable (not a path — same convention as nuclei).
+            if tr.result.ok:
+                tls.append({"port": tr.port, **parse_tls_cert(tr.result.grepable)})
+            continue
         if tr.kind in ("dir", "ffuf", "whatweb", "curl"):
             key = (tr.port, tr.vhost)
             entry = web_map.get(key)
@@ -173,6 +181,7 @@ def build_document(
                 findings.append({**f, "port": tr.port, "vhost": tr.vhost,
                                  "url": tr.title})
     findings.sort(key=lambda f: (nuclei_severity_rank(f["severity"]), f["name"]))
+    tls.sort(key=lambda c: (c.get("port") is None, c.get("port") or 0))
 
     # Per-tool evidence files already in the run dir (reports not yet written).
     artifacts = sorted(
@@ -198,6 +207,8 @@ def build_document(
         # DNS fingerprint, re-parsed from the whois/dig/axfr runs (same dual-parse
         # the pipeline does for its live map).
         "dns": build_dns_map(host, domain, tool_runs),
+        # TLS certs per HTTPS port, re-parsed from the tls runs (dual-parse).
+        "tls": tls,
         "web": list(web_map.values()),
         "discovery": discovery,
         "exploits": exploits,
@@ -293,6 +304,23 @@ def _render_summary_text(doc: dict[str, Any]) -> str:
             for ns, status in axfr.items():
                 note = "  <-- zone exposed" if status == "OPEN" else ""
                 lines.append(f"    {ns}: {status}{note}")
+        lines.append("")
+
+    tls = doc.get("tls") or []
+    if tls:
+        lines.append("TLS certificates")
+        for cert in tls:
+            port = cert.get("port")
+            lines.append(f"  Port {port}" if port is not None else "  Certificate")
+            if cert.get("cn"):
+                lines.append(f"    CN:       {cert['cn']}")
+            sans = cert.get("sans") or []
+            if sans:
+                lines.append(f"    SANs:     {', '.join(sans)}")
+            if cert.get("issuer"):
+                lines.append(f"    Issuer:   {cert['issuer']}")
+            if cert.get("not_after"):
+                lines.append(f"    Expires:  {cert['not_after']}")
         lines.append("")
 
     web = doc["web"]
@@ -439,6 +467,23 @@ def _render_markdown(doc: dict[str, Any]) -> str:
                 note = " — zone exposed" if status == "OPEN" else ""
                 lines.append(f"- {_md_escape(ns)}: {status}{note}")
             lines.append("")
+
+    tls = doc.get("tls") or []
+    if tls:
+        lines.append("## TLS certificates")
+        lines.append("")
+        lines.append("| Port | CN | SANs | Issuer | Expires |")
+        lines.append("|---:|---|---|---|---|")
+        for cert in tls:
+            port = "" if cert.get("port") is None else str(cert["port"])
+            sans = ", ".join(cert.get("sans") or [])
+            lines.append(
+                f"| {port} | {_md_escape(cert.get('cn') or '-')} | "
+                f"{_md_escape(sans or '-')} | "
+                f"{_md_escape(cert.get('issuer') or '-')} | "
+                f"{_md_escape(cert.get('not_after') or '-')} |"
+            )
+        lines.append("")
 
     web = doc["web"]
     if web:
@@ -596,6 +641,17 @@ def _render_xml(doc: dict[str, Any]) -> str:
     axfr_el = ET.SubElement(dns_el, "zoneTransfer")
     for ns, status in (dns.get("axfr") or {}).items():
         ET.SubElement(axfr_el, "nameserver", {"name": ns, "status": status})
+
+    tls_el = ET.SubElement(root, "tls")
+    for cert in doc.get("tls", []):
+        cert_el = ET.SubElement(tls_el, "cert", {
+            "port": "" if cert.get("port") is None else str(cert["port"])})
+        _sub(cert_el, "cn", cert.get("cn") or "")
+        _sub(cert_el, "issuer", cert.get("issuer") or "")
+        _sub(cert_el, "notAfter", cert.get("not_after") or "")
+        sans_el = ET.SubElement(cert_el, "sans")
+        for san in cert.get("sans") or []:
+            _sub(sans_el, "san", san)
 
     web_el = ET.SubElement(root, "web")
     for w in doc["web"]:

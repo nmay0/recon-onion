@@ -43,6 +43,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "nmap_service": "",
         "whois": "",
         "dig": "",
+        "tls_cert": "",
         "gobuster": "",
         "ffuf": "",
         "whatweb": "",

@@ -83,7 +83,7 @@ class ToolRun:
     name: str
     title: str
     result: "ToolResult"
-    kind: str = ""  # scan | whois | dig | axfr | dir | ffuf | vhost | dns | whatweb | curl | searchsploit | nuclei
+    kind: str = ""  # scan | whois | dig | axfr | tls | dir | ffuf | vhost | dns | whatweb | curl | searchsploit | nuclei
     port: int | None = None
     vhost: str | None = None
 
@@ -476,6 +476,155 @@ def ns_hostnames(records: dict[str, list[str]]) -> list[str]:
         if h and h not in hosts:
             hosts.append(h)
     return hosts
+
+
+# --------------------------------------------------------------------------- #
+# TLS certificate inspection + SAN discovery
+# --------------------------------------------------------------------------- #
+
+# How long to wait for openssl s_client to connect / hand back the cert.
+_TLS_TIMEOUT = 20
+
+# SANs in the x509 text are a comma-separated list like
+# "DNS:foo.com, DNS:*.bar.com, IP Address:1.2.3.4"; pull only the DNS entries.
+_TLS_SAN_RE = re.compile(r"DNS:([^,\s]+)")
+# "Subject: ... CN = example.com" — tolerate "CN=" and "CN = " spacing.
+_TLS_CN_RE = re.compile(r"Subject:.*?\bCN\s*=\s*([^\n,/]+)")
+# Prefer the issuer org, fall back to the issuer CN.
+_TLS_ISSUER_O_RE = re.compile(r"Issuer:.*?\bO\s*=\s*([^\n,/]+)")
+_TLS_ISSUER_CN_RE = re.compile(r"Issuer:.*?\bCN\s*=\s*([^\n,/]+)")
+_TLS_NOT_AFTER_RE = re.compile(r"Not After\s*:\s*(.+)")
+
+
+def _extract_tls_fields(x509_text: str) -> dict:
+    """Pull SANs / CN / issuer / expiry out of ``openssl x509 -noout -text``.
+
+    SANs are de-duped, order-preserving, with wildcards (``*.``) dropped (they
+    aren't concrete vhost candidates). CN is included as a SAN candidate too when
+    it's a plain hostname, since older certs may carry it without a SAN entry.
+    """
+    sans: list[str] = []
+    for raw in _TLS_SAN_RE.findall(x509_text):
+        name = raw.strip().rstrip(".")
+        if not name or name.startswith("*."):
+            continue
+        if name not in sans:
+            sans.append(name)
+
+    cn = ""
+    m = _TLS_CN_RE.search(x509_text)
+    if m:
+        cn = m.group(1).strip()
+
+    # Surface the CN as a vhost candidate when it's a concrete hostname.
+    if cn and not cn.startswith("*.") and "." in cn and cn not in sans:
+        sans.append(cn)
+
+    issuer = ""
+    mi = _TLS_ISSUER_O_RE.search(x509_text) or _TLS_ISSUER_CN_RE.search(x509_text)
+    if mi:
+        issuer = mi.group(1).strip()
+
+    not_after = ""
+    ma = _TLS_NOT_AFTER_RE.search(x509_text)
+    if ma:
+        not_after = ma.group(1).strip()
+
+    return {"sans": sans, "cn": cn, "issuer": issuer, "not_after": not_after}
+
+
+def tls_cert(host: str, port: int, artifact: Path, *, extra: str = "") -> ToolResult:
+    """Fetch and decode the TLS certificate presented on *host*:*port*.
+
+    Two chained openssl calls (no shell, no string interpolation): (a)
+    ``openssl s_client -connect host:port -servername host`` with empty stdin
+    (s_client otherwise blocks waiting for input), then (b) the captured PEM is
+    fed into ``openssl x509 -noout -text`` to decode it. The decoded text is the
+    human artifact; the parsed SAN/CN/issuer/expiry is stored as a JSON string
+    in ``ToolResult.grepable`` (the structured copy — same human/structured split
+    as the nuclei wrapper, which also stores content rather than a path).
+
+    *extra* flags (config ``tool_flags["tls_cert"]``) are appended to the
+    s_client invocation, e.g. ``-tls1_2`` to pin a protocol version.
+    """
+    command = ["openssl", "s_client", "-connect", f"{host}:{port}",
+               "-servername", host, *flag_list(extra)]
+    json_path = artifact.with_suffix(".json")
+    if not tool_available("openssl"):
+        return ToolResult(name="tls_cert", command=command, skipped=True,
+                          error="openssl not installed", artifact=artifact)
+
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        connect = subprocess.run(
+            command, input=b"", capture_output=True, timeout=_TLS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        artifact.write_text(f"$ {' '.join(command)}\n\ntimed out\n",
+                            encoding="utf-8")
+        return ToolResult(name="tls_cert", command=command,
+                          error="timed out", artifact=artifact)
+    except OSError as exc:  # pragma: no cover - defensive
+        return ToolResult(name="tls_cert", command=command, error=str(exc),
+                          artifact=artifact)
+
+    pem = connect.stdout or b""
+    if b"BEGIN CERTIFICATE" not in pem:
+        # No cert handed back: not a TLS port, handshake failed, or refused.
+        msg = (connect.stderr or b"").decode("utf-8", "replace").strip()
+        artifact.write_text(
+            f"$ {' '.join(command)}\n\nno certificate returned\n{msg}\n",
+            encoding="utf-8")
+        return ToolResult(name="tls_cert", command=command,
+                          returncode=connect.returncode,
+                          error="no certificate returned", artifact=artifact)
+
+    decode_cmd = ["openssl", "x509", "-noout", "-text"]
+    try:
+        decode = subprocess.run(
+            decode_cmd, input=pem, capture_output=True, timeout=_TLS_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as exc:  # pragma: no cover
+        return ToolResult(name="tls_cert", command=command,
+                          error=f"decode failed: {exc}", artifact=artifact)
+
+    x509_text = (decode.stdout or b"").decode("utf-8", "replace")
+    artifact.write_text(
+        f"$ {' '.join(command)} | {' '.join(decode_cmd)}\n\n{x509_text}",
+        encoding="utf-8")
+
+    parsed = _extract_tls_fields(x509_text)
+    json_content = json.dumps(parsed, indent=2, ensure_ascii=False) + "\n"
+    try:
+        json_path.write_text(json_content, encoding="utf-8")
+    except OSError:  # pragma: no cover - defensive; grepable carries the content
+        pass
+
+    return ToolResult(name="tls_cert", command=command, returncode=0,
+                      stdout=x509_text, artifact=artifact,
+                      grepable=json_content)
+
+
+def parse_tls_cert(grepable: str) -> dict:
+    """Parse the JSON content stored in ``ToolResult.grepable`` by tls_cert.
+
+    *grepable* is the JSON string (content, not a path — same convention as
+    nuclei). Returns a dict with keys ``sans`` (list), ``cn``, ``issuer``,
+    ``not_after``.
+    """
+    if not grepable:
+        return {}
+    try:
+        data = json.loads(grepable)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    sans = data.get("sans")
+    return {
+        "sans": list(sans) if isinstance(sans, list) else [],
+        "cn": data.get("cn") or "",
+        "issuer": data.get("issuer") or "",
+        "not_after": data.get("not_after") or "",
+    }
 
 
 # --------------------------------------------------------------------------- #

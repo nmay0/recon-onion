@@ -100,6 +100,7 @@ def print_summary(
     exploits: list[dict] | None = None,
     findings: list[dict] | None = None,
     dns_map: dict | None = None,
+    tls: list[dict] | None = None,
 ) -> None:
     """Print the per-host wrap-up: open ports, services, notable hits, exploits."""
     console.print()
@@ -121,6 +122,26 @@ def print_summary(
     dns_tree = _dns_map_tree(dns_map or {})
     if dns_tree is not None:
         console.print(dns_tree)
+
+    tls = tls or []
+    if tls:
+        table = Table(title="TLS certificates", title_style="bold cyan",
+                      header_style="bold")
+        table.add_column("Port", justify="right", style="green")
+        table.add_column("CN", overflow="fold")
+        table.add_column("SANs", overflow="fold")
+        table.add_column("Issuer", overflow="fold")
+        table.add_column("Expires", overflow="fold", style="dim")
+        for cert in tls:
+            sans = cert.get("sans") or []
+            table.add_row(
+                str(cert.get("port", "")),
+                cert.get("cn") or "-",
+                ", ".join(sans) if sans else "-",
+                cert.get("issuer") or "-",
+                cert.get("not_after") or "-",
+            )
+        console.print(table)
 
     notable = {url: hits for url, hits in gobuster_hits.items() if hits}
     if notable:

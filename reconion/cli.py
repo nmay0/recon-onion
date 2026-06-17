@@ -24,10 +24,11 @@ from .output import print_tool_block
 from .pipeline import DEFAULT_TOGGLES, run_host
 from .report import REPORT_FORMATS
 
-# Tools checked at startup. ffuf is omitted on purpose: it's opt-in (off by
-# default), so its absence is only reported if a run actually enables it.
-REQUIRED_TOOLS = ["nmap", "whois", "dig", "gobuster", "whatweb", "curl",
-                  "searchsploit"]
+# Tools checked at startup. Opt-in tools (ffuf, nuclei) and tools that degrade
+# gracefully when absent (openssl/tls_cert returns a skipped ToolResult) are
+# omitted — their absence is surfaced at run time, not as a startup warning.
+REQUIRED_TOOLS = ["nmap", "whois", "dig", "gobuster", "whatweb",
+                  "curl", "searchsploit"]
 
 
 class Session:
@@ -321,6 +322,7 @@ EDITABLE_FIELDS: list[tuple[str, list[str]]] = [
     ("extra flags: nmap_service", ["tool_flags", "nmap_service"]),
     ("extra flags: whois", ["tool_flags", "whois"]),
     ("extra flags: dig", ["tool_flags", "dig"]),
+    ("extra flags: tls_cert", ["tool_flags", "tls_cert"]),
     ("extra flags: gobuster", ["tool_flags", "gobuster"]),
     ("extra flags: ffuf", ["tool_flags", "ffuf"]),
     ("extra flags: whatweb", ["tool_flags", "whatweb"]),
