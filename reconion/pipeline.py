@@ -39,6 +39,9 @@ DEFAULT_TOGGLES: dict[str, bool] = {
     "whatweb": True,
     "curl": True,
     "nuclei": False,         # opt-in: heavy/noisy; enable via 'Modify run'
+    # Not a tool: a pre-scan probe that auto-detects catch-all ("wildcard")
+    # responses and injects the matching exclude flag into gobuster_dir / ffuf.
+    "auto_calibrate": True,
 }
 
 
@@ -339,6 +342,8 @@ def _run_web_stage(
     contexts: list[tuple[str | None, str]] = (
         [(vh, f"_{_slug(vh)}") for vh in vhosts] if vhosts else [(None, "")]
     )
+    # Pre-scan catch-all detection for the content-discovery tools (dir / ffuf).
+    auto_cal = toggles.get("auto_calibrate", True)
 
     for p in web_ports:
         scheme = "https" if p.is_https else "http"
@@ -379,7 +384,8 @@ def _run_web_stage(
                                      url, wl,
                                      run_dir / f"gobuster_dir_{p.number}{sfx}.txt",
                                      extra=tflags.get("gobuster", ""),
-                                     insecure=insecure, host_header=hh)))
+                                     insecure=insecure, host_header=hh,
+                                     calibrate=auto_cal)))
 
             if toggles.get("ffuf", False):
                 wl = wordlists.get("ffuf", "")
@@ -390,7 +396,7 @@ def _run_web_stage(
                                      url, wl,
                                      run_dir / f"ffuf_{p.number}{sfx}.txt",
                                      extra=tflags.get("ffuf", ""),
-                                     host_header=hh)))
+                                     host_header=hh, calibrate=auto_cal)))
 
             if toggles.get("nuclei", False):
                 jobs.append((disp, "nuclei", p.number, host_header,

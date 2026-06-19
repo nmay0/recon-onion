@@ -23,6 +23,8 @@ def print_tool_block(console: Console, title: str, result: ToolResult) -> None:
     console.rule(f"[bold cyan]{title}[/bold cyan]", align="left")
     if result.command:
         console.print(f"[dim]$ {result.cmdline}[/dim]", highlight=False)
+    if result.note:
+        console.print(Text(result.note, style="cyan"))
     if result.skipped:
         console.print(f"[yellow]skipped — {result.error}[/yellow]")
         return

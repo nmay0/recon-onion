@@ -13,8 +13,10 @@ data and pull notable hits out of gobuster output.
 from __future__ import annotations
 
 import json
+import random
 import re
 import shutil
+import string
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,6 +67,9 @@ class ToolResult:
     # or nuclei JSONL), kept separate from the human-readable stdout shown to the
     # user. Structured parsing reads from here, never from stdout.
     grepable: str = ""
+    # Optional one-line note surfaced in the live block + artifact header (e.g.
+    # an auto-calibration summary). Cosmetic; never parsed.
+    note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -99,18 +104,20 @@ def _run(
     *,
     write_stdout: bool = True,
     timeout: int = DEFAULT_TIMEOUT,
+    note: str = "",
 ) -> ToolResult:
     """Run *command*, writing an artifact, and return a ToolResult.
 
     When *write_stdout* is True the captured stdout is written to *artifact*
     (used for tools whose primary output is stdout). When False, the tool is
     assumed to have written *artifact* itself (e.g. nmap -oN) and we only
-    record a header if it didn't.
+    record a header if it didn't. *note*, when given, is recorded on the result
+    and prepended to the artifact as a leading comment.
     """
     binary = command[0]
     if not tool_available(binary):
         return ToolResult(name=name, command=command, skipped=True,
-                          error=f"{binary} not installed")
+                          error=f"{binary} not installed", note=note)
     try:
         proc = subprocess.run(
             command,
@@ -120,9 +127,9 @@ def _run(
         )
     except subprocess.TimeoutExpired:
         return ToolResult(name=name, command=command, error="timed out",
-                          artifact=artifact)
+                          artifact=artifact, note=note)
     except OSError as exc:  # pragma: no cover - defensive
-        return ToolResult(name=name, command=command, error=str(exc))
+        return ToolResult(name=name, command=command, error=str(exc), note=note)
 
     result = ToolResult(
         name=name,
@@ -131,11 +138,12 @@ def _run(
         stdout=proc.stdout,
         stderr=proc.stderr,
         artifact=artifact,
+        note=note,
     )
 
     artifact.parent.mkdir(parents=True, exist_ok=True)
     if write_stdout:
-        header = f"$ {result.cmdline}\n\n"
+        header = f"# {note}\n$ {result.cmdline}\n\n" if note else f"$ {result.cmdline}\n\n"
         body = proc.stdout
         if proc.stderr.strip():
             body += f"\n--- stderr ---\n{proc.stderr}"
@@ -634,8 +642,166 @@ def parse_tls_cert(grepable: str) -> dict:
 GOBUSTER_INTERESTING = {200, 204, 301, 302, 307, 308, 401, 403, 405}
 
 
+# --------------------------------------------------------------------------- #
+# Auto-calibration: catch-all ("wildcard") response detection
+# --------------------------------------------------------------------------- #
+# Some servers answer *every* path with the same response (a custom 403/302, a
+# SPA's index.html, a WAF block, ...), so naive content discovery reports every
+# wordlist entry as a "hit" and the artifact balloons to megabytes of identical
+# noise. Before a gobuster/ffuf run we probe a handful of random, almost-
+# certainly-absent paths; if the server answers them uniformly we inject the
+# matching exclude flag so the real run filters the flood out up front instead
+# of drowning in it (and gobuster doesn't abort on its own wildcard check).
+
+# Number of random probe paths, split between two lengths so a catch-all that
+# *reflects* the requested path back into the body surfaces as varying sizes.
+CALIBRATION_SAMPLES = 10
+_CALIB_SHORT, _CALIB_LONG = 10, 30
+# Minimum usable probe responses before we trust a verdict.
+_CALIB_MIN_SAMPLES = 6
+# Statuses safe to blanket-filter when uniform: the "interesting" set minus the
+# high-value 200/204, which we never blanket (that would hide real pages).
+_BLANKET_STATUS = GOBUSTER_INTERESTING - {200, 204}
+
+# Filter/match flags a user might set in a tool's extra flags; if any are
+# present we leave calibration off and respect the explicit choice.
+_GOBUSTER_FILTER_FLAGS = {"-b", "--status-codes-blacklist", "-s",
+                          "--status-codes", "--exclude-length", "--wildcard"}
+_FFUF_FILTER_FLAGS = {"-fc", "-fs", "-fl", "-fw", "-fr", "-ac", "-acc", "-ach",
+                      "-mc", "-ms", "-ml", "-mw", "-mr"}
+
+
+@dataclass
+class Calibration:
+    """Verdict from probing a web target for catch-all behaviour.
+
+    ``kind`` is one of: ``none`` (no catch-all / undecidable — do nothing),
+    ``size`` (every probe returned the same body size — filter that size),
+    ``status`` (every probe returned the same low-value status — filter it), or
+    ``warn`` (a high-value catch-all, e.g. uniform 200 with a varying body, that
+    can't be filtered without hiding real pages — surface a note, filter nothing).
+    """
+
+    kind: str = "none"
+    status: int = 0
+    size: int = 0
+    samples: list[tuple[int, int]] = field(default_factory=list)
+    note: str = ""
+
+    def gobuster_args(self) -> list[str]:
+        if self.kind == "size":
+            # --wildcard stops gobuster aborting on its own wildcard check; the
+            # exclude-length then drops the catch-all responses from the results.
+            return ["--wildcard", "--exclude-length", str(self.size)]
+        if self.kind == "status":
+            return ["-b", f"404,{self.status}"]
+        return []
+
+    def ffuf_args(self) -> list[str]:
+        if self.kind == "size":
+            return ["-fs", str(self.size)]
+        if self.kind == "status":
+            return ["-fc", str(self.status)]
+        return []
+
+
+def _random_path(length: int) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits,
+                                  k=length))
+
+
+def _decide_calibration(samples: list[tuple[int, int]]) -> Calibration:
+    """Turn (status, size) probe samples into a Calibration verdict.
+
+    Pure (no I/O) so the policy is unit-testable. Prefers an exact body-size
+    filter (surgical — a real page of a different size still shows) and falls
+    back to a status filter (robust to a catch-all that varies its body per
+    path); never blanket-filters the high-value 200/204.
+    """
+    valid = [(c, s) for c, s in samples if c]  # drop connect failures (code 0)
+    if len(valid) < _CALIB_MIN_SAMPLES:
+        return Calibration()
+    statuses = {c for c, _ in valid}
+    sizes = {s for _, s in valid}
+    if statuses == {404}:
+        return Calibration()  # proper 404s; the default 404 exclusion handles it
+    if len(sizes) == 1:
+        size = next(iter(sizes))
+        if size > 0:
+            return Calibration(
+                kind="size", size=size, samples=valid,
+                note=f"auto-calibration: catch-all detected (every probe -> "
+                     f"size {size}); filtering responses of size {size}")
+    if len(statuses) == 1:
+        status = next(iter(statuses))
+        if status in _BLANKET_STATUS:
+            return Calibration(
+                kind="status", status=status, samples=valid,
+                note=f"auto-calibration: catch-all detected (every probe -> "
+                     f"HTTP {status}); filtering status {status}")
+        if status in (200, 204):
+            return Calibration(
+                kind="warn", status=status, samples=valid,
+                note=f"auto-calibration: catch-all HTTP {status} with a varying "
+                     f"body; not auto-filtering (would hide real pages) -- add a "
+                     f"manual size/regex filter if the output floods")
+    return Calibration()
+
+
+def calibrate_web(url: str, *, host_header: str | None = None) -> Calibration:
+    """Probe *url* with random absent paths and judge catch-all behaviour.
+
+    One curl call fetches CALIBRATION_SAMPLES random paths (mixed lengths) and
+    reports each response's status + body size; _decide_calibration turns the
+    samples into a verdict. Any failure (curl missing, target down, timeout)
+    degrades to a no-op ``none`` verdict so a flaky probe never invents a filter.
+    """
+    if not tool_available("curl"):
+        return Calibration()
+    base = url.rstrip("/")
+    insecure = base.lower().startswith("https://")
+    half = CALIBRATION_SAMPLES // 2
+    lengths = [_CALIB_SHORT] * half + [_CALIB_LONG] * (CALIBRATION_SAMPLES - half)
+    probe_urls = [f"{base}/{_random_path(n)}" for n in lengths]
+    command = ["curl", "-sS", "--connect-timeout", "4", "--max-time", "20",
+               "-w", "%{http_code} %{size_download}\n"]
+    if insecure:
+        command.append("-k")
+    if host_header:
+        command += ["-H", f"Host: {host_header}"]
+    # curl applies -o per URL: pair a /dev/null sink with each probe path. A
+    # single shared -o would only sink the first URL, leaking the other response
+    # bodies onto stdout and corrupting the -w samples.
+    for probe in probe_urls:
+        command += ["-o", "/dev/null", probe]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return Calibration()
+    samples: list[tuple[int, int]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            code, size = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        samples.append((code, size))  # code 0 (== curl 000) means connect failed
+    return _decide_calibration(samples)
+
+
+def _user_filters_present(extra: str, flags: set[str]) -> bool:
+    """True if *extra* already sets one of *flags* (so we skip calibration)."""
+    for tok in flag_list(extra):
+        if tok in flags or tok.split("=", 1)[0] in flags:
+            return True
+    return False
+
+
 def gobuster_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
-                 insecure: bool, host_header: str | None = None) -> ToolResult:
+                 insecure: bool, host_header: str | None = None,
+                 calibrate: bool = False) -> ToolResult:
     command = ["gobuster", "dir", "-u", url, "-w", wordlist, "-q", "--no-color"]
     if insecure:
         command.append("-k")
@@ -643,12 +809,19 @@ def gobuster_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
         # Target the IP but route to the right virtual host via the Host header,
         # so no /etc/hosts entry is required.
         command += ["-H", f"Host: {host_header}"]
+    note = ""
+    if (calibrate and tool_available("gobuster")
+            and not _user_filters_present(extra, _GOBUSTER_FILTER_FLAGS)):
+        cal = calibrate_web(url, host_header=host_header)
+        command += cal.gobuster_args()
+        note = cal.note
     command += flag_list(extra)
-    return _run("gobuster_dir", command, artifact)
+    return _run("gobuster_dir", command, artifact, note=note)
 
 
 def ffuf_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
-             host_header: str | None = None) -> ToolResult:
+             host_header: str | None = None,
+             calibrate: bool = False) -> ToolResult:
     """Fast content discovery: fuzz the FUZZ keyword at the URL path.
 
     ffuf ignores TLS cert errors by default, so no insecure flag is needed for
@@ -659,8 +832,15 @@ def ffuf_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
     command = ["ffuf", "-u", fuzz_url, "-w", wordlist, "-noninteractive"]
     if host_header:
         command += ["-H", f"Host: {host_header}"]
+    note = ""
+    if (calibrate and tool_available("ffuf")
+            and not _user_filters_present(extra, _FFUF_FILTER_FLAGS)):
+        # Calibrate against the base URL, not the FUZZ path.
+        cal = calibrate_web(url, host_header=host_header)
+        command += cal.ffuf_args()
+        note = cal.note
     command += flag_list(extra)
-    return _run("ffuf", command, artifact)
+    return _run("ffuf", command, artifact, note=note)
 
 
 def gobuster_dns(domain: str, wordlist: str, artifact: Path, *, extra: str) -> ToolResult:
