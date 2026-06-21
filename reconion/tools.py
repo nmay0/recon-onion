@@ -280,6 +280,90 @@ def parse_grepable_ports(stdout: str) -> list[Port]:
 
 
 # --------------------------------------------------------------------------- #
+# Fast port scanners — rustscan + masscan
+# --------------------------------------------------------------------------- #
+# Speed-oriented alternatives to nmap's port discovery: they sweep all 65535
+# TCP ports far faster than `nmap -p-`, then hand the open ports to the existing
+# nmap_service stage for version/script detection (kept as the single source of
+# service data). rustscan is the default primary full-range discovery; the
+# pipeline holds nmap_full back as a fallback that runs only if the fast
+# scanner(s) fail (see run_host).
+
+
+def rustscan(target: str, artifact: Path, *, extra: str) -> ToolResult:
+    """Fast all-ports TCP discovery with rustscan (greppable, no built-in nmap).
+
+    ``-g`` makes rustscan emit just the open ports (``<ip> -> [22,80]``) and skip
+    its own nmap hand-off, so nmap_service stays the single source of
+    service/version data. ``--no-config`` ignores any ~/.rustscan.toml for
+    deterministic runs. rustscan uses a TCP connect scan by default, so unlike
+    masscan it needs no special privileges. Its output is already greppable, so
+    it is parsed (parse_rustscan) straight from stdout, mirrored into .grepable
+    to keep the "parse structured data from .grepable" invariant uniform.
+    """
+    command = ["rustscan", "-a", target, "-g", "--no-config", *flag_list(extra)]
+    result = _run("rustscan", command, artifact, write_stdout=True)
+    result.grepable = result.stdout
+    return result
+
+
+def masscan(target: str, artifact: Path, *, extra: str,
+            prefix: str = "") -> ToolResult:
+    """Fast all-ports TCP discovery with masscan; ports feed the nmap service scan.
+
+    masscan needs raw-socket privileges (root). Per config, an optional *prefix*
+    (e.g. ``sudo``) is prepended; with an empty prefix masscan is run directly
+    and errors clearly if unprivileged (no auto-sudo — honours the opt-in-sudo
+    convention). Results are written in nmap grepable format to a side file
+    (``-oG``) and parsed by parse_grepable_ports — the same human/structured
+    split as nmap. The packet rate stays conservative (config tool_flags default
+    ``--rate 1000``) so the scan observes without flooding the target; never
+    raise it to a level that could DoS the target (recon-only invariant).
+    """
+    if not tool_available("masscan"):
+        return ToolResult(name="masscan", command=["masscan"], skipped=True,
+                          error="masscan not installed")
+    grep_path = artifact.with_suffix(".gnmap")
+    # prefix (e.g. "sudo") leads the argv when set; _run re-checks command[0],
+    # which is then "sudo" (present) — masscan itself was verified just above.
+    command = [*flag_list(prefix), "masscan", "-p", "1-65535",
+               "-oG", str(grep_path), *flag_list(extra), target]
+    result = _run("masscan", command, artifact, write_stdout=True)
+    try:
+        result.grepable = grep_path.read_text(encoding="utf-8")
+    except OSError:
+        result.grepable = result.stdout  # privilege error / no results -> no file
+    return result
+
+
+# rustscan greppable line: "127.0.0.1 -> [22,80,443]" (empty list when none).
+_RUSTSCAN_LINE_RE = re.compile(r"->\s*\[([0-9,\s]*)\]")
+
+
+def parse_rustscan(text: str) -> list[Port]:
+    """Parse rustscan greppable output into Ports (numbers only; no service yet).
+
+    rustscan -g lists open TCP port numbers per host; the nmap_service stage
+    fills in service/version later. Ports across all lines are merged and sorted.
+    """
+    found: dict[int, Port] = {}
+    for line in text.splitlines():
+        m = _RUSTSCAN_LINE_RE.search(line)
+        if not m:
+            continue
+        for tok in m.group(1).split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                num = int(tok)
+            except ValueError:
+                continue
+            found.setdefault(num, Port(number=num, proto="tcp"))
+    return [found[n] for n in sorted(found)]
+
+
+# --------------------------------------------------------------------------- #
 # DNS infrastructure fingerprinting — whois + dig
 # --------------------------------------------------------------------------- #
 

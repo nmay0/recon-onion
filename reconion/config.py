@@ -26,6 +26,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     # nmap timing template applied to every nmap stage.
     "nmap_timing": "-T4",
+    # Optional command prefix for tools needing raw-socket privileges (masscan).
+    # Empty = run the tool directly (no auto-sudo; honours the opt-in-sudo rule).
+    # Set to "sudo" to run masscan privileged — needs a non-interactive/NOPASSWD
+    # sudo or it will hang waiting for a password during the parallel scan burst.
+    "privileged_prefix": "",
     # DNS infrastructure fingerprinting (whois + dig), run alongside the port
     # scan. record_types is the space-separated list dig queries for the domain;
     # a reverse PTR for the target IP and an AXFR attempt per discovered NS are
@@ -41,6 +46,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "nmap_quick": "",
         "nmap_full": "",
         "nmap_service": "",
+        # Fast port scanners. masscan's rate is capped low by default so the scan
+        # never floods the target (recon-only: never DoS) — tune with care.
+        "rustscan": "",
+        "masscan": "--rate 1000",
         "whois": "",
         "dig": "",
         "tls_cert": "",

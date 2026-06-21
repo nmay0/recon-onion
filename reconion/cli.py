@@ -310,6 +310,7 @@ def _get_nested(cfg: dict[str, Any], path: list[str]) -> Any:
 # Editable fields: label -> path into the config dict.
 EDITABLE_FIELDS: list[tuple[str, list[str]]] = [
     ("nmap timing flag", ["nmap_timing"]),
+    ("privileged prefix (e.g. sudo, for masscan)", ["privileged_prefix"]),
     ("output directory", ["output_dir"]),
     ("dns record types", ["dns", "record_types"]),
     ("wordlist: dir", ["wordlists", "dir"]),
@@ -320,6 +321,8 @@ EDITABLE_FIELDS: list[tuple[str, list[str]]] = [
     ("extra flags: nmap_quick", ["tool_flags", "nmap_quick"]),
     ("extra flags: nmap_full", ["tool_flags", "nmap_full"]),
     ("extra flags: nmap_service", ["tool_flags", "nmap_service"]),
+    ("extra flags: rustscan", ["tool_flags", "rustscan"]),
+    ("extra flags: masscan", ["tool_flags", "masscan"]),
     ("extra flags: whois", ["tool_flags", "whois"]),
     ("extra flags: dig", ["tool_flags", "dig"]),
     ("extra flags: tls_cert", ["tool_flags", "tls_cert"]),
