@@ -1,9 +1,9 @@
 """Per-host pipeline orchestration.
 
 Stage flow for a single host:
-  1.  initial recon burst (parallel): nmap quick + the primary fast scanner
-      (rustscan/masscan) + DNS. nmap full (-p-) joins the burst only when no
-      fast scanner is usable (the plain nmap-only flow).
+  1.  initial recon burst (parallel): the primary fast scanner (rustscan/
+      masscan) + DNS. nmap quick+full join the burst only when no fast scanner
+      is usable (the plain nmap-only flow).
   1a. nmap full fallback (sequential): runs only when every usable fast scanner
       failed — guarantees full-range discovery.
   3.  service/version/script scan -> on the union of open ports.
@@ -29,10 +29,12 @@ from .tools import Port, ToolResult, ToolRun
 
 # Toggle keys, all default-on except the optional gobuster modes and ffuf.
 DEFAULT_TOGGLES: dict[str, bool] = {
+    # nmap_quick/full are the nmap *discovery* path; they run only when there's
+    # no usable fast scanner (then both run as primary in the burst), with
+    # nmap_full also the sequential fallback if a fast scanner fails (see
+    # run_host). A successful rustscan/masscan covers every port, so both nmap
+    # discovery scans are skipped and nmap is used for service detection only.
     "nmap_quick": True,
-    # nmap_full is the *fallback* full-range scan: it runs only when no usable
-    # fast scanner succeeds (see run_host). Disable rustscan/masscan to make it
-    # the primary full-range scan again (it then runs in the parallel burst).
     "nmap_full": True,
     # rustscan is the default primary full-range discovery (fast, rootless).
     # masscan is opt-in (needs root / config privileged_prefix). Either feeds
@@ -136,7 +138,7 @@ def run_host(
     fast_available = any(
         toggles.get(t, False) and tools.tool_available(t) for t in fast_toggles)
     init_jobs: list[tuple[str, str, str, Callable[[], ToolResult]]] = []
-    if toggles.get("nmap_quick", True):
+    if toggles.get("nmap_quick", True) and not fast_available:
         init_jobs.append(("nmap_quick", "scan", "nmap_quick", lambda:
             tools.nmap_quick(host, run_dir / "nmap_quick.txt", timing=timing,
                              extra=tflags.get("nmap_quick", ""))))
@@ -211,8 +213,9 @@ def run_host(
             scan_groups.append(tools.parse_grepable_ports(res.grepable))
             merged = _merge_ports(*scan_groups)
         else:
-            console.print("  [dim]nmap_full (-p-) skipped — fast scanner handled "
-                          "full-range discovery.[/dim]")
+            console.print("  [dim]nmap discovery scans skipped — rustscan/masscan "
+                          "covered all ports; nmap runs for service/version "
+                          "detection only.[/dim]")
 
     open_ports = sorted(merged.values(), key=lambda p: p.number)
     if open_ports:
