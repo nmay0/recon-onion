@@ -36,6 +36,7 @@ class Session:
 
     def __init__(self) -> None:
         self.toggles: dict[str, bool] = copy.deepcopy(DEFAULT_TOGGLES)
+        self.target: str | None = None
         self.domain: str | None = None
         self.vhosts: list[str] = []
 
@@ -243,7 +244,10 @@ def _select_hosts(console: Console, live: list[str]) -> list[str]:
 
 
 def run_flow(console: Console, session: Session) -> None:
-    raw = Prompt.ask("Target [bold]IP or CIDR[/bold]").strip()
+    # The prompt defaults to the last target so repeat runs (e.g. after a config
+    # tweak) need no retyping; delete it and type a new one to change targets.
+    raw = Prompt.ask("Target [bold]IP or CIDR[/bold]",
+                     default=session.target or "").strip()
     if not raw:
         return
     single, range_hosts, err = parse_target(raw)
@@ -251,11 +255,16 @@ def run_flow(console: Console, session: Session) -> None:
         console.print(f"[red]{err}[/red]")
         return
 
+    # Remember the (normalised) target so the next run pre-fills it.
+    session.target = single if single is not None else raw
+
     # ---- single host -------------------------------------------------------
     if single is not None:
         config = _ask_config(console)
         domain = _maybe_domain(console, session.toggles, session.domain)
         vhosts = _prompt_vhosts(console, session.vhosts)
+        # Persist what was entered so the DNS/vhost prompts pre-fill next run.
+        session.domain, session.vhosts = domain, vhosts
         _run_target(console, single, config, session.toggles, domain, vhosts)
         return
 
