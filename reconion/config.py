@@ -38,6 +38,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "dns": {
         "record_types": "A AAAA NS SOA MX TXT CNAME",
     },
+    # Recursive gobuster dir/vhost: when a scan finds a directory (or vhost),
+    # drill into it and scan again, up to max_depth levels deep, to map as much
+    # structure as possible. mode is never | prompt | always:
+    #   never  - no recursion (the discovery scans run once, as before).
+    #   prompt - ask before recursing into each discovered directory/vhost.
+    #   always - recurse automatically into every discovered directory/vhost.
+    # In prompt AND always, a catch-all probe first confirms the hit is not a
+    # false positive (a wildcard server that answers everything), so recursion
+    # can never run away forever. max_depth is stored as a string for the config
+    # editor and parsed to an int (mirrors dns.record_types).
+    "recursion": {
+        "mode": "never",
+        "max_depth": "2",
+    },
     # Root output directory; runs land under <output_dir>/<host>/<timestamp>/.
     "output_dir": "./recon",
     # Extra flags appended per tool/stage (a single string each, split on spaces).

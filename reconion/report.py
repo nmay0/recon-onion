@@ -18,6 +18,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 from .tools import (
@@ -80,6 +81,23 @@ def parse_gobuster_structured(stdout: str) -> list[dict[str, Any]]:
             "redirect": redirect or None,
         })
     return hits
+
+
+def _base_path(url: str) -> str:
+    """The path component of a gobuster target URL (``/admin`` or ``""``).
+
+    Recursive dir scans target a sub-path (title ``http://h:80/admin``); their
+    hits are reported relative to it, so the base path is prepended to keep the
+    report's paths absolute (and distinct across the recursion tree).
+    """
+    return urlsplit(url).path.rstrip("/")
+
+
+def _abs_hit_path(base: str, path: str) -> str:
+    """Join a recursion base path with a hit's relative path."""
+    if not base:
+        return path
+    return f"{base}/{path.lstrip('/')}"
 
 
 def extract_whatweb(stdout: str) -> str:
@@ -161,7 +179,13 @@ def build_document(
             if not entry["url"]:
                 entry["url"] = tr.title
             if tr.kind == "dir":
-                entry["gobuster"] = parse_gobuster_structured(out)
+                # Recursion produces several dir runs per (port, vhost); merge
+                # them, prepending each run's base path so /admin's /users shows
+                # as /admin/users instead of clobbering the top-level scan.
+                base = _base_path(tr.title)
+                for hit in parse_gobuster_structured(out):
+                    hit["path"] = _abs_hit_path(base, hit["path"])
+                    entry["gobuster"].append(hit)
             elif tr.kind == "ffuf":
                 entry["ffuf"] = parse_ffuf_structured(out)
             elif tr.kind == "whatweb":
@@ -169,7 +193,10 @@ def build_document(
             elif tr.kind == "curl":
                 entry["headers"] = extract_headers(out)
         elif tr.kind == "vhost":
-            discovery["vhost"] = parse_gobuster_hits(out)
+            # Recursive vhost sweeps add more Found: lines; extend, not replace.
+            for line in parse_gobuster_hits(out):
+                if line not in discovery["vhost"]:
+                    discovery["vhost"].append(line)
         elif tr.kind == "dns":
             discovery["dns"] = parse_gobuster_hits(out)
         elif tr.kind == "searchsploit":

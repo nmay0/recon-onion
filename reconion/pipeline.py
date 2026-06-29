@@ -22,10 +22,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from rich.console import Console
+from rich.prompt import Confirm
 
 from . import report, tools
 from .output import make_run_dir, print_summary, print_tool_block
 from .tools import Port, ToolResult, ToolRun
+
+# Hard ceiling on recursive gobuster scans per host: a safety net independent of
+# max_depth / the catch-all guard, so a pathological tree can never run away.
+_RECURSION_MAX_SCANS = 50
 
 # Toggle keys, all default-on except the optional gobuster modes and ffuf.
 DEFAULT_TOGGLES: dict[str, bool] = {
@@ -401,6 +406,16 @@ def _run_web_stage(
     # Pre-scan catch-all detection for the content-discovery tools (dir / ffuf).
     auto_cal = toggles.get("auto_calibrate", True)
 
+    # Recursive gobuster: capture the context each dir/vhost scan needs to be
+    # re-run one level deeper, then drill in (sequentially, on the main thread so
+    # 'prompt' mode can ask) after the parallel pass below.
+    rec_mode, rec_depth = _recursion_settings(config)
+    recurse_on = rec_mode != "never" and rec_depth > 0
+    dir_ctx: dict[tuple[int, str | None], dict[str, Any]] = {}
+    vhost_ctx: dict[int, dict[str, Any]] = {}
+    dir_seeds: list[tuple[tuple[int, str | None], str]] = []
+    vhost_seeds: list[tuple[int, str]] = []
+
     for p in web_ports:
         scheme = "https" if p.is_https else "http"
         insecure = p.is_https
@@ -411,10 +426,14 @@ def _run_web_stage(
             wl = wordlists.get("vhost", "")
             if _wordlist_ok(wl, "gobuster_vhost", result.errors):
                 jobs.append((f"{ip_url} (vhost)", "vhost", p.number, None,
-                             lambda url=ip_url, wl=wl, p=p, insecure=insecure:
-                             tools.gobuster_vhost(
+                             lambda url=ip_url, wl=wl, p=p, insecure=insecure,
+                             dom=domain: tools.gobuster_vhost(
                                  url, wl, run_dir / f"gobuster_vhost_{p.number}.txt",
-                                 extra=tflags.get("gobuster", ""), insecure=insecure)))
+                                 extra=tflags.get("gobuster", ""),
+                                 insecure=insecure, domain=dom)))
+                if recurse_on:
+                    vhost_ctx[p.number] = {
+                        "ip_url": ip_url, "insecure": insecure, "wordlist": wl}
 
         if toggles.get("gobuster_dns", False) and domain and not dns_done:
             wl = wordlists.get("dns", "")
@@ -442,6 +461,10 @@ def _run_web_stage(
                                      extra=tflags.get("gobuster", ""),
                                      insecure=insecure, host_header=hh,
                                      calibrate=auto_cal)))
+                    if recurse_on:
+                        dir_ctx[(p.number, host_header)] = {
+                            "ip_url": ip_url, "insecure": insecure,
+                            "suffix": suffix, "wordlist": wl, "disp": disp}
 
             if toggles.get("ffuf", False):
                 wl = wordlists.get("ffuf", "")
@@ -496,9 +519,244 @@ def _run_web_stage(
                 port=port, vhost=vhost))
             if kind in ("dir", "vhost", "dns"):
                 result.gobuster_hits[url] = tools.parse_gobuster_hits(res.stdout)
+                if recurse_on and kind == "dir" and (port, vhost) in dir_ctx:
+                    for word in tools.recursable_dirs(res.stdout):
+                        dir_seeds.append(((port, vhost), word))
+                elif recurse_on and kind == "vhost" and port in vhost_ctx:
+                    for vh in tools.found_vhosts(res.stdout):
+                        vhost_seeds.append((port, vh))
             elif kind == "ffuf":
                 result.ffuf_hits[url] = tools.parse_ffuf_hits(res.stdout)
             elif kind == "nuclei":
                 for f in tools.parse_nuclei(res.grepable):
                     result.findings.append(
                         {**f, "port": port, "vhost": vhost, "url": url})
+
+    # ---- recursion: drill into discovered directories / vhosts --------------
+    if recurse_on and (dir_seeds or vhost_seeds):
+        console.print(
+            f"\n[bold]▶ Recursive enumeration[/bold] [dim](mode: {rec_mode}, "
+            f"max depth: {rec_depth})[/dim]")
+        stats = {"scans": 0}
+        if dir_seeds:
+            _recurse_dirs(console, rec_mode, rec_depth, dir_seeds, dir_ctx,
+                          tflags, run_dir, result, stats, auto_cal)
+        if vhost_seeds and domain:
+            _recurse_vhosts(console, rec_mode, rec_depth, vhost_seeds, vhost_ctx,
+                            tflags, run_dir, result, stats)
+
+
+# --------------------------------------------------------------------------- #
+# Recursive gobuster (dir / vhost)
+# --------------------------------------------------------------------------- #
+# When a discovery scan finds a directory (or vhost), drill into it and scan
+# again, up to max_depth levels. The orchestration here is the *policy* (depth,
+# visited-set, caps, the catch-all false-positive guard, and prompt/always
+# gating); the tool-specific *mechanism* (run gobuster, record it, find the next
+# level) lives in the per-kind `scan` closures below. Runs sequentially on the
+# caller's thread — after the parallel web pass — so 'prompt' mode can ask
+# without two threads fighting over the console.
+
+# Independent of max_depth and the catch-all guard: a hard ceiling on how many
+# *candidates* we even examine (each costs a probe), so a wildcard server that
+# reports thousands of bogus hits can't tie us up forever.
+_RECURSION_MAX_CANDIDATES = 200
+
+
+def _recursion_settings(config: dict[str, Any]) -> tuple[str, int]:
+    """Return (mode, max_depth) for gobuster recursion from config.
+
+    mode is never|prompt|always (anything else -> never). max_depth is a
+    non-negative int, stored as a string in config for the field editor.
+    """
+    rec = config.get("recursion", {}) or {}
+    mode = str(rec.get("mode", "never")).strip().lower()
+    if mode not in ("never", "prompt", "always"):
+        mode = "never"
+    try:
+        depth = int(str(rec.get("max_depth", "2")).strip())
+    except (TypeError, ValueError):
+        depth = 2
+    return mode, max(0, depth)
+
+
+# A recursion work item: (tid, depth, display, payload). `tid` is the identity
+# used for the visited-set; `payload` is whatever the kind's callbacks need.
+_WorkItem = tuple[Any, int, str, Any]
+
+
+def _drive_recursion(
+    console: Console,
+    mode: str,
+    max_depth: int,
+    *,
+    queue: list[_WorkItem],
+    fp_check: Callable[[Any], tuple[bool, str]],
+    scan: Callable[[Any, int], list[_WorkItem]],
+    stats: dict[str, int],
+) -> None:
+    """Breadth-first driver shared by dir/vhost recursion.
+
+    For each candidate: skip if already visited or past max_depth; enforce the
+    scan and candidate caps; run the catch-all false-positive guard (always — so
+    a wildcard can never recurse forever, in *any* auto/prompt mode); in 'prompt'
+    mode ask the user; otherwise scan it and enqueue the next level.
+    """
+    visited: set[Any] = set()
+    stats.setdefault("seen", 0)
+    while queue:
+        tid, depth, disp, payload = queue.pop(0)
+        if tid in visited or depth > max_depth:
+            continue
+        visited.add(tid)
+        if stats["scans"] >= _RECURSION_MAX_SCANS:
+            console.print(f"  [yellow]recursion cap ({_RECURSION_MAX_SCANS} "
+                          f"scans) reached; stopping.[/yellow]")
+            return
+        if stats["seen"] >= _RECURSION_MAX_CANDIDATES:
+            console.print(f"  [yellow]recursion cap "
+                          f"({_RECURSION_MAX_CANDIDATES} candidates) reached; "
+                          f"stopping.[/yellow]")
+            return
+        stats["seen"] += 1
+        is_fp, note = fp_check(payload)
+        if is_fp:
+            console.print(f"  [dim]skip {disp} — {note}[/dim]")
+            continue
+        if mode == "prompt" and not Confirm.ask(
+                f"  Recurse into [bold]{disp}[/bold]?", default=False):
+            continue
+        stats["scans"] += 1
+        for child in scan(payload, depth):
+            ctid, cdepth, _, _ = child
+            if ctid not in visited and cdepth <= max_depth:
+                queue.append(child)
+
+
+def _recurse_dirs(
+    console: Console,
+    mode: str,
+    max_depth: int,
+    seeds: list[tuple[tuple[int, str | None], str]],
+    dir_ctx: dict[tuple[int, str | None], dict[str, Any]],
+    tflags: dict[str, str],
+    run_dir: Path,
+    result: HostResult,
+    stats: dict[str, int],
+    auto_cal: bool,
+) -> None:
+    """Recurse gobuster dir into discovered directories.
+
+    A payload is (ctx_key, full_path), where ctx_key=(port, host_header) selects
+    the web context and full_path is the directory path relative to that
+    context's base URL (gobuster reports hits relative to its -u URL, so each
+    level's children get the parent path prepended).
+    """
+    gflags = tflags.get("gobuster", "")
+
+    def tid(ctx_key, full):
+        return ("dir", ctx_key, full)
+
+    def disp_for(ctx_key, full):
+        return f"{dir_ctx[ctx_key]['disp'].rstrip('/')}/{full}"
+
+    def fp_check(payload):
+        ctx_key, full = payload
+        ctx = dir_ctx[ctx_key]
+        probe = f"{ctx['ip_url'].rstrip('/')}/{full}"
+        cal = tools.calibrate_web(probe, host_header=ctx_key[1])
+        if cal.kind != "none":
+            return True, f"catch-all ({cal.kind}); not a real directory"
+        return False, ""
+
+    def scan(payload, depth):
+        ctx_key, full = payload
+        port, host_header = ctx_key
+        ctx = dir_ctx[ctx_key]
+        disp = disp_for(ctx_key, full)
+        scan_url = f"{ctx['ip_url'].rstrip('/')}/{full}"
+        artifact = run_dir / f"gobuster_dir_{port}{ctx['suffix']}_{_slug(full)}.txt"
+        res = tools.gobuster_dir(
+            scan_url, ctx["wordlist"], artifact, extra=gflags,
+            insecure=ctx["insecure"], host_header=host_header, calibrate=auto_cal)
+        _record(res, result.errors)
+        print_tool_block(console, f"gobuster_dir — {disp} (depth {depth})", res)
+        result.tool_runs.append(ToolRun(
+            name="gobuster_dir", title=disp, result=res, kind="dir",
+            port=port, vhost=host_header))
+        result.gobuster_hits[disp] = tools.parse_gobuster_hits(res.stdout)
+        children: list[_WorkItem] = []
+        for word in tools.recursable_dirs(res.stdout):
+            child = (ctx_key, f"{full}/{word}")
+            children.append((tid(*child), depth + 1, disp_for(*child), child))
+        return children
+
+    queue: list[_WorkItem] = []
+    for ctx_key, word in seeds:
+        if ctx_key in dir_ctx:
+            payload = (ctx_key, word)
+            queue.append((tid(*payload), 1, disp_for(*payload), payload))
+    _drive_recursion(console, mode, max_depth, queue=queue, fp_check=fp_check,
+                     scan=scan, stats=stats)
+
+
+def _recurse_vhosts(
+    console: Console,
+    mode: str,
+    max_depth: int,
+    seeds: list[tuple[int, str]],
+    vhost_ctx: dict[int, dict[str, Any]],
+    tflags: dict[str, str],
+    run_dir: Path,
+    result: HostResult,
+    stats: dict[str, int],
+) -> None:
+    """Recurse gobuster vhost into discovered virtual hosts (nested subdomains).
+
+    A payload is (port, fqdn). To look for <word>.<fqdn> while still hitting the
+    target IP, the found vhost is passed as gobuster's --domain (appended to each
+    bare wordlist word), so the Host headers <word>.<fqdn> go to the IP.
+    """
+    gflags = tflags.get("gobuster", "")
+
+    def tid(port, fqdn):
+        return ("vhost", port, fqdn)
+
+    def disp_for(port, fqdn):
+        return f"{vhost_ctx[port]['ip_url']} (vhost: {fqdn})"
+
+    def fp_check(payload):
+        port, fqdn = payload
+        ctx = vhost_ctx[port]
+        cal = tools.calibrate_vhost(ctx["ip_url"], fqdn, insecure=ctx["insecure"])
+        if cal.kind != "none":
+            return True, f"catch-all vhost ({cal.kind}); not recursing"
+        return False, ""
+
+    def scan(payload, depth):
+        port, fqdn = payload
+        ctx = vhost_ctx[port]
+        disp = disp_for(port, fqdn)
+        artifact = run_dir / f"gobuster_vhost_{port}_{_slug(fqdn)}.txt"
+        res = tools.gobuster_vhost(
+            ctx["ip_url"], ctx["wordlist"], artifact, extra=gflags,
+            insecure=ctx["insecure"], domain=fqdn)
+        _record(res, result.errors)
+        print_tool_block(console, f"gobuster_vhost — {disp} (depth {depth})", res)
+        result.tool_runs.append(ToolRun(
+            name="gobuster_vhost", title=disp, result=res, kind="vhost",
+            port=port, vhost=None))
+        result.gobuster_hits[disp] = tools.parse_gobuster_hits(res.stdout)
+        children: list[_WorkItem] = []
+        for child_fqdn in tools.found_vhosts(res.stdout):
+            child = (port, child_fqdn)
+            children.append((tid(*child), depth + 1, disp_for(*child), child))
+        return children
+
+    queue: list[_WorkItem] = []
+    for port, fqdn in seeds:
+        if port in vhost_ctx:
+            payload = (port, fqdn)
+            queue.append((tid(*payload), 1, disp_for(*payload), payload))
+    _drive_recursion(console, mode, max_depth, queue=queue, fp_check=fp_check,
+                     scan=scan, stats=stats)

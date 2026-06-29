@@ -322,6 +322,8 @@ EDITABLE_FIELDS: list[tuple[str, list[str]]] = [
     ("privileged prefix (e.g. sudo, for masscan)", ["privileged_prefix"]),
     ("output directory", ["output_dir"]),
     ("dns record types", ["dns", "record_types"]),
+    ("gobuster recursion mode (never/prompt/always)", ["recursion", "mode"]),
+    ("gobuster recursion max depth", ["recursion", "max_depth"]),
     ("wordlist: dir", ["wordlists", "dir"]),
     ("wordlist: dns", ["wordlists", "dns"]),
     ("wordlist: vhost", ["wordlists", "vhost"]),

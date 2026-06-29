@@ -875,6 +875,48 @@ def calibrate_web(url: str, *, host_header: str | None = None) -> Calibration:
     return _decide_calibration(samples)
 
 
+def calibrate_vhost(url: str, base_domain: str, *, insecure: bool) -> Calibration:
+    """The vhost analogue of calibrate_web: probe random Host headers under
+    *base_domain* against *url* (the target IP) and judge catch-all behaviour.
+
+    Used as the false-positive guard before a *recursive* vhost sweep: if the
+    server answers a handful of random, certainly-nonexistent virtual hosts
+    (``<random>.<base_domain>``) with a uniform status/size, it's a catch-all and
+    any vhost 'discovered' under it is bogus — so recursing would never end. A
+    non-``none`` verdict means catch-all. Unlike calibrate_web the Host header is
+    what varies, and curl applies ``-H`` to the whole invocation (not per-URL),
+    so each probe is its own curl call. Any failure degrades to ``none`` — but
+    callers should treat that conservatively, since 'undecidable' is not 'safe'.
+    """
+    if not tool_available("curl"):
+        return Calibration()
+    base = url.rstrip("/")
+    half = CALIBRATION_SAMPLES // 2
+    lengths = [_CALIB_SHORT] * half + [_CALIB_LONG] * (CALIBRATION_SAMPLES - half)
+    samples: list[tuple[int, int]] = []
+    for n in lengths:
+        host_header = f"{_random_path(n)}.{base_domain}"
+        command = ["curl", "-sS", "--connect-timeout", "4", "--max-time", "15",
+                   "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
+                   "-H", f"Host: {host_header}"]
+        if insecure:
+            command.append("-k")
+        command.append(base)
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True,
+                                  timeout=20)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        parts = proc.stdout.split()
+        if len(parts) != 2:
+            continue
+        try:
+            samples.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            continue
+    return _decide_calibration(samples)
+
+
 def _user_filters_present(extra: str, flags: set[str]) -> bool:
     """True if *extra* already sets one of *flags* (so we skip calibration)."""
     for tok in flag_list(extra):
@@ -934,9 +976,20 @@ def gobuster_dns(domain: str, wordlist: str, artifact: Path, *, extra: str) -> T
 
 
 def gobuster_vhost(url: str, wordlist: str, artifact: Path, *, extra: str,
-                   insecure: bool) -> ToolResult:
-    command = ["gobuster", "vhost", "-u", url, "-w", wordlist, "-q", "--no-color",
-               "--append-domain"]
+                   insecure: bool, domain: str | None = None) -> ToolResult:
+    """Virtual-host discovery against *url* (the target IP).
+
+    When *domain* is given, gobuster appends it to every wordlist word
+    (``--domain <domain> --append-domain``): a bare subdomain wordlist (www, dev,
+    ...) becomes Host headers ``www.<domain>`` etc. sent to the IP — the rootless
+    pattern. The explicit ``--domain`` is essential for an IP target: plain
+    ``--append-domain`` appends the *URL host*, i.e. the IP, giving useless
+    ``www.<ip>`` probes. When *domain* is None the wordlist entries are sent
+    verbatim as fully-qualified Host headers.
+    """
+    command = ["gobuster", "vhost", "-u", url, "-w", wordlist, "-q", "--no-color"]
+    if domain:
+        command += ["--domain", domain, "--append-domain"]
     if insecure:
         command.append("-k")
     command += flag_list(extra)
@@ -986,6 +1039,78 @@ def parse_gobuster_hits(stdout: str) -> list[str]:
         elif line.startswith("Found:"):  # dns mode
             hits.append(line)
     return hits
+
+
+# Recursion helpers: pull the *recursable* targets out of gobuster output.
+# A directory hit, e.g.:  /admin   (Status: 301) [Size: 312] [--> /admin/]
+_DIR_LINE_RE = re.compile(
+    r"^(?P<path>/\S*)\s+\(Status:\s*(?P<status>\d+)\)"
+    r"(?:\s*\[Size:\s*\d+\])?"
+    r"(?:\s*\[-->\s*(?P<redirect>[^\]]*)\])?"
+)
+# 30x to "<path>/" is gobuster's canonical "this is a folder" signal.
+_DIR_REDIRECT_STATUS = {301, 302, 307, 308}
+# A vhost hit, e.g.:  Found: admin.example.com Status: 200 [Size: 1234]
+_VHOST_LINE_RE = re.compile(r"^Found:\s*(?P<host>[^\s(]+)")
+
+
+def recursable_dirs(stdout: str) -> list[str]:
+    """Word-paths from gobuster *dir* output worth recursing into.
+
+    A hit is treated as a directory when it redirects (30x) to its own path with
+    a trailing slash, or returns 200/401/403 on an extension-less path. Leaf
+    files (a 200 on /index.php, a redirect off elsewhere, ...) are skipped so
+    recursion drills into structure, not files. Paths are returned relative to
+    the scanned base (the leading slash stripped) de-duplicated in first-seen
+    order — gobuster reports each hit relative to its ``-u`` URL, so the caller
+    rebuilds the full path itself.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if "Status:" not in line:
+            continue
+        m = _DIR_LINE_RE.match(line)
+        if not m:
+            continue
+        status = int(m.group("status"))
+        if status not in GOBUSTER_INTERESTING:
+            continue
+        path = m.group("path").strip("/")
+        if not path or path in seen:
+            continue
+        redirect = (m.group("redirect") or "").strip()
+        is_dir = False
+        if status in _DIR_REDIRECT_STATUS:
+            # No captured redirect (older gobuster) or one ending in "/" -> folder.
+            is_dir = not redirect or redirect.rstrip().endswith("/")
+        elif status in (200, 401, 403):
+            # Extension-less final segment -> treat as a directory, not a file.
+            is_dir = "." not in path.rsplit("/", 1)[-1]
+        if is_dir:
+            seen.add(path)
+            found.append(path)
+    return found
+
+
+def found_vhosts(stdout: str) -> list[str]:
+    """Virtual-host names reported by gobuster *vhost* output (``Found:`` lines),
+    de-duplicated in first-seen order, trailing dots stripped."""
+    hosts: list[str] = []
+    seen: set[str] = set()
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line.startswith("Found:"):
+            continue
+        m = _VHOST_LINE_RE.match(line)
+        if not m:
+            continue
+        name = m.group("host").strip().rstrip(".")
+        if name and name not in seen:
+            seen.add(name)
+            hosts.append(name)
+    return hosts
 
 
 # ffuf result line: "admin   [Status: 301, Size: 312, Words: 20, Lines: 10, ...]"

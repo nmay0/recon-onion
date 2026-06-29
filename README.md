@@ -83,6 +83,28 @@ Menu:
 (or the per-host prompt on a CIDR); you'll be asked for a domain, since those
 modes enumerate names rather than scan an IP.
 
+### Recursive enumeration
+
+When a `gobuster dir`/`vhost` scan finds a directory (or virtual host), recon
+onion can drill into it and scan again, building out the tree. It's controlled by
+the `recursion` config setting (**Edit config**):
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `recursion.mode` | `never` · `prompt` · `always` | `never` |
+| `recursion.max_depth` | how many levels deep to drill | `2` |
+
+- **never** — no recursion (discovery scans run once).
+- **prompt** — asks before recursing into each discovered directory/vhost.
+- **always** — recurses automatically into every confirmed hit.
+
+In **prompt** and **always**, a catch-all probe first confirms each hit is a real
+directory/vhost and not a wildcard server answering everything — so recursion can
+never run away forever. Recursion runs after the parallel web pass (so `prompt`
+can ask cleanly), and is additionally bounded by a depth limit, a visited-set,
+and per-host scan caps. Recursive hits fold into the normal summary and reports
+(directory paths shown absolute, e.g. `/admin/users`).
+
 ### Virtual hosts (no /etc/hosts edit required)
 
 Name-based virtual hosts normally won't respond correctly when you hit the raw
@@ -119,6 +141,7 @@ your overrides** and missing keys fall back to defaults automatically.
 | `output_dir` | `./recon` |
 | `wordlists.dir` / `wordlists.ffuf` | `/usr/share/wordlists/dirb/common.txt` |
 | `wordlists.dns` / `wordlists.vhost` | seclists subdomains top-5000 |
+| `recursion.mode` / `recursion.max_depth` | `never` / `2` (see [Recursive enumeration](#recursive-enumeration)) |
 | `tool_flags.<tool>` | empty (extra flags per stage) |
 | `output_formats.<fmt>` | `summary`, `json`, `markdown` on; `raw`, `xml` off |
 
