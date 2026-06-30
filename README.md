@@ -1,30 +1,52 @@
 # recon onion
 
-A Python recon-automation tool that orchestrates `nmap`, `gobuster`, `ffuf`,
-`whatweb`, `curl`, and `searchsploit` into a staged, partly-parallel pipeline
-with a small `rich`-based CLI.
+A Python recon-automation tool that orchestrates `nmap`, `rustscan`/`masscan`,
+`whois`, `dig`, `gobuster`, `ffuf`, `whatweb`, `curl`, `nuclei`, and
+`searchsploit` into a staged, partly-parallel pipeline with a small `rich`-based
+CLI.
 
 > **Authorized testing only.** Use exclusively against systems you own or have
 > explicit written permission to assess.
 
 ## Pipeline
 
-For each target host:
+For each target host, in stages (some parallel, some dependent):
 
-1. **Quick scan** — `nmap -F` (top ports) fires immediately.
-2. **Full scan** — `nmap -p-` runs *in parallel* with the quick scan.
-3. **Service scan** — once ports are known, `nmap -sV -sC` runs against the
-   union of all discovered open ports (also emitting an XML copy for the next step).
-4. **Exploit search** — `searchsploit --nmap` reads the service-scan XML and
+1. **Port discovery + DNS (parallel burst).**
+   - *Ports:* `rustscan` sweeps all 65535 TCP ports (fast, rootless) by default;
+     `masscan` is an opt-in alternative (needs root — see `privileged_prefix`).
+     If no fast scanner is usable, `nmap -F` + `nmap -p-` run as the primary
+     discovery instead. Open ports from whatever ran feed one union. If a fast
+     scanner was tried but failed, `nmap -p-` runs as a fallback so full-range
+     discovery is never lost.
+   - *DNS infrastructure:* `whois` (target IP, plus the domain if you give one)
+     and `dig` (forward records + reverse PTR) run alongside the port scan; a
+     `dig AXFR` zone-transfer attempt then follows against each discovered
+     nameserver.
+2. **Service scan** — `nmap -sV -sC` runs against the union of open ports (also
+   emitting an XML copy for the next step).
+3. **Exploit search** — `searchsploit --nmap` reads the service-scan XML and
    searches Exploit-DB for each detected product/version.
-5. **Web enumeration** — for every detected web port, `gobuster` + `whatweb` +
-   `curl -I` (and `ffuf`, if enabled) run *in parallel*.
+4. **TLS certificates** — for each HTTPS port, the certificate is pulled and
+   decoded (CN, SANs, issuer, expiry). Concrete SAN hostnames are auto-offered as
+   virtual-host candidates for the web stage (only when you didn't specify vhosts
+   yourself).
+5. **Web enumeration** — for every detected web port, `gobuster dir` + `whatweb` +
+   `curl -I` (and `ffuf` / `nuclei`, if enabled) run *in parallel*, once per
+   Host-header context. Discovered directories/virtual hosts are then recursed
+   into (see [Recursive enumeration](#recursive-enumeration)).
    - HTTPS-aware: `https://` scheme for gobuster/whatweb and `-k` for curl on
      443/8443 (or any `ssl`/`https` service), so self-signed certs don't break.
+   - Auto-calibration: before each `gobuster dir`/`ffuf` run, a quick probe
+     detects catch-all ("wildcard") servers and injects the matching filter so
+     the results aren't drowned in identical noise.
 
-`ffuf` is **off by default** (content discovery overlaps with `gobuster dir`);
-enable it via *Modify run* or the per-host CIDR prompt. `searchsploit` is on by
-default and only runs when the service scan produced results.
+Default-on stages: rustscan, the nmap service scan, whois, dig, TLS, searchsploit,
+`gobuster dir`, whatweb, curl. Opt-in (enable via *Modify run* or the per-host
+CIDR prompt): masscan, ffuf, nuclei, `gobuster dns`/`vhost`. Recursion is off by
+default too, switched on in *Edit config* (see [Recursive enumeration](#recursive-enumeration)).
+`searchsploit` only runs when the service scan produced results; `nuclei` is
+scoped to detection/version-CVE templates (it never acts on the target).
 
 CIDR ranges run an `nmap -sn` discovery sweep first, then **pause** so you can
 review the live hosts and exclude any before enumeration. Each kept host is then
@@ -45,12 +67,15 @@ Built for Linux (Debian/Kali, where these tools and the default
 missing one is skipped with a warning:
 
 ```bash
-sudo apt install nmap gobuster ffuf whatweb exploitdb curl seclists
+sudo apt install nmap gobuster ffuf whatweb exploitdb curl seclists \
+                 whois dnsutils masscan
 ```
 
 (`exploitdb` provides `searchsploit`; `seclists` provides the dns/vhost
-wordlists. On Kali most of these ship preinstalled. `ffuf` is only needed if you
-enable it.)
+wordlists; `dnsutils` provides `dig`. On Kali most of these ship preinstalled.
+`rustscan` (the default fast scanner) and `nuclei` (opt-in) aren't in apt —
+install them from their own releases; if `rustscan` is absent recon onion falls
+back to `nmap`, and `nuclei`/`ffuf`/`masscan` are simply skipped unless enabled.)
 
 ## Run
 
@@ -139,6 +164,8 @@ your overrides** and missing keys fall back to defaults automatically.
 | --- | --- |
 | `nmap_timing` | `-T4` |
 | `output_dir` | `./recon` |
+| `privileged_prefix` | empty (set to `sudo` to run `masscan` privileged) |
+| `dns.record_types` | `A AAAA NS SOA MX TXT CNAME` |
 | `wordlists.dir` / `wordlists.ffuf` | `/usr/share/wordlists/dirb/common.txt` |
 | `wordlists.dns` / `wordlists.vhost` | seclists subdomains top-5000 |
 | `recursion.mode` / `recursion.max_depth` | `never` / `2` (see [Recursive enumeration](#recursive-enumeration)) |
@@ -151,29 +178,36 @@ Output formats are toggled in **Edit config** with the `o` key (see [Output](#ou
 
 As the pipeline runs, each tool's **raw output is printed live** as a block the
 moment it completes — so it reads like a script running the tools, even though
-stages still run in parallel under the hood. A summary table (open ports,
-services, notable gobuster/ffuf hits, `searchsploit` matches) prints at the end
-of each host.
+stages still run in parallel under the hood. A summary prints at the end of
+each host: open ports/services, the DNS map (whois/records/PTR/AXFR), TLS
+certificates, notable gobuster/ffuf hits, `nuclei` findings, and `searchsploit`
+matches.
 
 Everything is also saved to disk:
 
 ```
 recon/<target-ip>/<timestamp>/
-  nmap_quick.txt   nmap_full.txt   nmap_service.txt    # human-readable reports
+  rustscan.txt  masscan.txt                            # fast port discovery (if used)
+  nmap_quick.txt   nmap_full.txt   nmap_service.txt    # nmap human-readable reports
   nmap_quick.gnmap nmap_full.gnmap nmap_service.gnmap  # grepable (machine) output
   nmap_service.xml                                     # XML copy (fed to searchsploit)
+  whois_ip.txt  whois_<domain>.txt  dig.txt  dig_axfr.txt   # DNS infrastructure
+  tls_cert_<port>.txt                                  # TLS cert: CN / SANs / issuer / expiry
   searchsploit.txt                                     # Exploit-DB matches
-  gobuster_dir_<port>[_<vhost>].txt  gobuster_vhost_<port>.txt  gobuster_dns.txt
-  ffuf_<port>[_<vhost>].txt
+  gobuster_dir_<port>[_<vhost>][_<path>].txt  gobuster_vhost_<port>.txt  gobuster_dns.txt
+  ffuf_<port>[_<vhost>].txt  nuclei_<port>[_<vhost>].txt
   whatweb_<port>[_<vhost>].txt  curl_<port>[_<vhost>].txt
   report.txt  report.raw.txt  report.json  report.xml  report.md  # consolidated
 ```
 
+(Recursive `gobuster dir` runs add a `_<path>` suffix, e.g.
+`gobuster_dir_80_admin.txt`, so each level's evidence is kept separately.)
+
 The per-tool files above are **always** written as raw evidence. On top of those,
 each host run emits one **consolidated report** per format you've enabled — a
-single document built from the run's findings (open ports + services, web
-findings with parsed gobuster/ffuf hits / `whatweb` tech / response headers,
-`searchsploit` matches, warnings):
+single document built from the run's findings (open ports + services, the DNS
+map, TLS certificates, web findings with parsed gobuster/ffuf hits / `whatweb`
+tech / response headers, `nuclei` findings, `searchsploit` matches, warnings):
 
 | Format | File | Use |
 |--------|------|-----|
