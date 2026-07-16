@@ -57,6 +57,10 @@ DEFAULT_TOGGLES: dict[str, bool] = {
     "gobuster_vhost": False,
     "whatweb": True,
     "curl": True,
+    # Passive path discovery: fetch server-declared files (robots.txt /
+    # sitemap.xml / security.txt) and extract the paths/hosts they volunteer.
+    # Cheap, low-noise, brute-forces nothing — on by default like whatweb/curl.
+    "declared_files": True,
     "nuclei": False,         # opt-in: heavy/noisy; enable via 'Modify run'
     # Not a tool: a pre-scan probe that auto-detects catch-all ("wildcard")
     # responses and injects the matching exclude flag into gobuster_dir / ffuf.
@@ -71,6 +75,8 @@ class HostResult:
     ports: list[Port] = field(default_factory=list)
     gobuster_hits: dict[str, list[str]] = field(default_factory=dict)
     ffuf_hits: dict[str, list[str]] = field(default_factory=dict)
+    # Passive declared-file findings per web context, keyed by display URL.
+    declared: dict[str, dict] = field(default_factory=dict)
     exploits: list[dict] = field(default_factory=list)
     # TLS certs per HTTPS port: {port, cn, sans, issuer, not_after}.
     tls: list[dict] = field(default_factory=list)
@@ -349,7 +355,7 @@ def run_host(
     print_summary(console, host, run_dir, result.ports, result.gobuster_hits,
                   result.errors, ffuf_hits=result.ffuf_hits,
                   exploits=result.exploits, findings=result.findings,
-                  dns_map=dns_map, tls=result.tls)
+                  dns_map=dns_map, tls=result.tls, declared=result.declared)
 
     # ---- Consolidated reports (formats chosen in config) -------------------
     document = report.build_document(
@@ -501,11 +507,21 @@ def _run_web_stage(
                                  insecure=insecure, extra=tflags.get("curl", ""),
                                  resolve=res)))
 
+            if toggles.get("declared_files", True):
+                resolve = ((host_header, p.number, host) if host_header else None)
+                decl_url = disp if host_header else ip_url
+                jobs.append((disp, "declared", p.number, host_header,
+                             lambda url=decl_url, p=p, insecure=insecure,
+                             res=resolve, sfx=suffix: tools.fetch_declared(
+                                 url, run_dir / f"declared_{p.number}{sfx}.txt",
+                                 insecure=insecure,
+                                 extra=tflags.get("declared", ""), resolve=res)))
+
     if not jobs:
         return
 
-    console.print("\n[bold]▶ Web enumeration — gobuster / whatweb / curl "
-                  "(parallel)[/bold]")
+    console.print("\n[bold]▶ Web enumeration — gobuster / whatweb / curl / "
+                  "declared (parallel)[/bold]")
     with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
         futures = {ex.submit(fn): (url, kind, port, vhost)
                    for url, kind, port, vhost, fn in jobs}
@@ -527,6 +543,8 @@ def _run_web_stage(
                         vhost_seeds.append((port, vh))
             elif kind == "ffuf":
                 result.ffuf_hits[url] = tools.parse_ffuf_hits(res.stdout)
+            elif kind == "declared":
+                result.declared[url] = tools.parse_declared(res.grepable)
             elif kind == "nuclei":
                 for f in tools.parse_nuclei(res.grepable):
                     result.findings.append(

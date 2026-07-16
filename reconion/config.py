@@ -71,6 +71,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "ffuf": "",
         "whatweb": "",
         "curl": "",
+        # Passive path discovery (robots.txt / sitemap.xml / security.txt) via
+        # curl — reads only files the server publishes; brute-forces nothing.
+        "declared": "",
         "searchsploit": "",
         # nuclei runs detection + version-CVE templates only: exclude every tag
         # that *acts* on the target so the tool stays pure recon. Tune the tags

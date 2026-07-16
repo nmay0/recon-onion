@@ -20,6 +20,7 @@ import string
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .config import flag_list
 
@@ -88,7 +89,7 @@ class ToolRun:
     name: str
     title: str
     result: "ToolResult"
-    kind: str = ""  # scan | whois | dig | axfr | tls | dir | ffuf | vhost | dns | whatweb | curl | searchsploit | nuclei
+    kind: str = ""  # scan | whois | dig | axfr | tls | dir | ffuf | vhost | dns | whatweb | curl | declared | searchsploit | nuclei
     port: int | None = None
     vhost: str | None = None
 
@@ -1146,6 +1147,240 @@ def parse_ffuf_structured(stdout: str) -> list[dict]:
             "size": int(m.group("size")),
         })
     return hits
+
+
+# --------------------------------------------------------------------------- #
+# Passive path discovery — server-declared files
+# --------------------------------------------------------------------------- #
+# robots.txt, sitemap.xml and .well-known/security.txt are files a server
+# *publishes about itself*: disallowed paths, the site's URL map, a security
+# contact. Reading them turns up real paths/hosts with no brute force at all, so
+# this stays strictly recon-only (unlike gobuster, which guesses). Each file is
+# fetched with its own curl call (mirroring curl_headers, incl. --resolve for a
+# rootless vhost context); the concatenated bodies are the human artifact and
+# the extracted structure is a JSON string in ToolResult.grepable (content, not
+# a path — the tls_cert / nuclei convention) for the report's dual-parse.
+
+_DECLARED_FILES = ("robots.txt", "sitemap.xml", ".well-known/security.txt")
+# Cap the body kept per file in the artifact (a sitemap can be huge) and the
+# number of sitemap <loc> URLs retained (bounds report / JSON size).
+_DECLARED_MAX_BODY = 20000
+_DECLARED_SITEMAP_LIMIT = 100
+# Known security.txt fields (RFC 9116); other lines are ignored so an HTML or
+# catch-all body can't inject noise.
+_SECURITY_FIELDS = {
+    "contact", "expires", "encryption", "acknowledgments", "acknowledgements",
+    "preferred-languages", "canonical", "policy", "hiring", "csaf",
+}
+_SITEMAP_LOC_RE = re.compile(r"<loc>\s*(.*?)\s*</loc>", re.IGNORECASE | re.DOTALL)
+# curl -w marker appended after each body so the status code can be split back
+# out of stdout without a second request.
+_DECLARED_STATUS_MARKER = "<<<HTTP {code}>>>"
+_DECLARED_STATUS_RE = re.compile(r"<<<HTTP (\d+)>>>")
+
+
+def _looks_like_html(body: str) -> bool:
+    """True when a supposedly plaintext/xml file is actually an HTML page — the
+    tell-tale of a catch-all / SPA answering every path with index.html."""
+    head = body.lstrip()[:512].lower()
+    return head.startswith("<!doctype html") or "<html" in head
+
+
+def _split_declared_output(raw: str) -> tuple[str, str]:
+    """Split a curl body from the trailing '<<<HTTP nnn>>>' status marker."""
+    idx = raw.rfind("<<<HTTP ")
+    if idx == -1:
+        return raw, ""
+    m = _DECLARED_STATUS_RE.search(raw[idx:])
+    return raw[:idx].rstrip("\n"), (m.group(1) if m else "")
+
+
+def parse_robots(text: str) -> dict[str, list[str]]:
+    """Extract declared paths (Disallow/Allow) and Sitemap URLs from robots.txt.
+
+    Only the directive lines are read, so an HTML/catch-all body yields nothing.
+    An empty ``Disallow:`` (= allow all) carries no path, so it is skipped.
+    """
+    paths: list[str] = []
+    sitemaps: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key, val = key.strip().lower(), val.strip()
+        if not val:
+            continue
+        if key in ("disallow", "allow"):
+            if val not in paths:
+                paths.append(val)
+        elif key == "sitemap":
+            if val not in sitemaps:
+                sitemaps.append(val)
+    return {"paths": paths, "sitemaps": sitemaps}
+
+
+def parse_sitemap(xml: str, *, limit: int = _DECLARED_SITEMAP_LIMIT) -> list[str]:
+    """Extract <loc> URLs from a sitemap (or sitemap index), de-duped, capped.
+
+    Regex rather than an XML parse so namespaced / slightly-malformed sitemaps
+    still yield their URLs. Handles both a URL set (page URLs) and a sitemap
+    index (child-sitemap URLs); either is surfaced without chasing nested files.
+    """
+    urls: list[str] = []
+    for raw in _SITEMAP_LOC_RE.findall(xml):
+        u = raw.strip()
+        if u and u not in urls:
+            urls.append(u)
+            if len(urls) >= limit:
+                break
+    return urls
+
+
+def parse_security_txt(text: str) -> dict[str, list[str]]:
+    """Parse .well-known/security.txt into {field: [values]} for known fields."""
+    fields: dict[str, list[str]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key, val = key.strip().lower(), val.strip()
+        if key in _SECURITY_FIELDS and val:
+            bucket = fields.setdefault(key, [])
+            if val not in bucket:
+                bucket.append(val)
+    return fields
+
+
+def fetch_declared(url: str, artifact: Path, *, insecure: bool, extra: str,
+                   resolve: tuple[str, int, str] | None = None) -> ToolResult:
+    """Fetch the server-declared files under *url* and extract what they expose.
+
+    Composite wrapper (like dig_axfr / tls_cert): one curl per file, a header
+    line per file recording its HTTP status, and a JSON structure in
+    ToolResult.grepable. Only an HTTP 200 text body is mined; a non-200, empty,
+    or HTML (catch-all) body is recorded but not parsed, so no false paths leak
+    in. *resolve* pins DNS+SNI to the target IP for a vhost context (curl
+    --resolve), exactly like curl_headers, so no /etc/hosts entry is needed.
+    """
+    if not tool_available("curl"):
+        return ToolResult(name="declared", command=["curl"], skipped=True,
+                          error="curl not installed", artifact=artifact)
+    base = url.rstrip("/")
+    data: dict[str, Any] = {"found": [], "robots_paths": [], "sitemaps": [],
+                            "sitemap_urls": [], "security": {}}
+    blocks: list[str] = []
+    shown: list[str] | None = None
+    for fname in _DECLARED_FILES:
+        command = ["curl", "-sS", "-L", "--max-redirs", "3",
+                   "--connect-timeout", "5", "--max-time", "20", "-w",
+                   "\n" + _DECLARED_STATUS_MARKER.format(code="%{http_code}")]
+        if insecure:
+            command.append("-k")
+        if resolve:
+            rhost, rport, rip = resolve
+            command += ["--resolve", f"{rhost}:{rport}:{rip}"]
+        command += flag_list(extra)
+        command.append(f"{base}/{fname}")
+        if shown is None:
+            shown = command  # a representative command for the header / report
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True,
+                                  timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as exc:  # pragma: no cover
+            blocks.append(f"=== {fname} [ERROR] ===\n{exc}")
+            continue
+        body, status = _split_declared_output(proc.stdout or "")
+        label = f"=== {fname} [HTTP {status or '000'}] ==="
+        if status != "200" or not body.strip():
+            blocks.append(f"{label}\n(no content)")
+            continue
+        if _looks_like_html(body):
+            blocks.append(f"{label}\n(looks like HTML — treated as catch-all, "
+                          "not parsed)")
+            continue
+        shown_body = (body if len(body) <= _DECLARED_MAX_BODY
+                      else body[:_DECLARED_MAX_BODY] + "\n... (truncated)")
+        blocks.append(f"{label}\n{shown_body}")
+        data["found"].append(fname)
+        if fname == "robots.txt":
+            parsed = parse_robots(body)
+            data["robots_paths"], data["sitemaps"] = (
+                parsed["paths"], parsed["sitemaps"])
+        elif fname == "sitemap.xml":
+            data["sitemap_urls"] = parse_sitemap(body)
+        else:
+            data["security"] = parse_security_txt(body)
+
+    text = "\n\n".join(blocks) + "\n"
+    command = shown or ["curl"]
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(f"$ {' '.join(command)}\n\n{text}", encoding="utf-8")
+    return ToolResult(name="declared", command=command, returncode=0,
+                      stdout=text, artifact=artifact,
+                      grepable=json.dumps(data, ensure_ascii=False))
+
+
+def parse_declared(grepable: str) -> dict[str, Any]:
+    """Re-read the JSON that fetch_declared stored in ToolResult.grepable.
+
+    Content, not a path (same convention as parse_tls_cert / parse_nuclei); the
+    report re-parses it independently of the pipeline (dual-parse).
+    """
+    if not grepable:
+        return {}
+    try:
+        data = json.loads(grepable)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    sec = data.get("security")
+    return {
+        "found": list(data.get("found") or []),
+        "robots_paths": list(data.get("robots_paths") or []),
+        "sitemaps": list(data.get("sitemaps") or []),
+        "sitemap_urls": list(data.get("sitemap_urls") or []),
+        "security": {k: list(v) for k, v in sec.items()}
+                    if isinstance(sec, dict) else {},
+    }
+
+
+def _preview(items: list[str], n: int) -> str:
+    """A comma-joined preview of the first *n* items, with a '+N more' tail."""
+    head = ", ".join(items[:n])
+    return head + (f"  (+{len(items) - n} more)" if len(items) > n else "")
+
+
+def declared_items(d: dict[str, Any]) -> list[tuple[str, str]]:
+    """Flatten a parsed 'declared' dict into (label, value) rows for display.
+
+    Shared by the live summary and the text / markdown reports so all three show
+    the same rows (the XML report emits the full lists instead). Long lists are
+    previewed; returns [] when nothing worth showing was declared.
+    """
+    items: list[tuple[str, str]] = []
+    robots = d.get("robots_paths") or []
+    if robots:
+        items.append((f"robots.txt ({len(robots)} paths)", _preview(robots, 12)))
+    sitemaps = d.get("sitemaps") or []
+    if sitemaps:
+        items.append(("declared sitemaps", ", ".join(sitemaps)))
+    sm_urls = d.get("sitemap_urls") or []
+    if sm_urls:
+        items.append((f"sitemap.xml ({len(sm_urls)} URLs)", _preview(sm_urls, 8)))
+    security = d.get("security") or {}
+    for key in ("contact", "policy", "expires", "encryption", "canonical",
+                "acknowledgments", "acknowledgements", "preferred-languages",
+                "hiring", "csaf"):
+        if security.get(key):
+            items.append((f"security.txt {key}", ", ".join(security[key])))
+    return items
 
 
 # --------------------------------------------------------------------------- #

@@ -11,7 +11,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from .tools import DIG_RECORD_TYPES, Port, ToolResult
+from .tools import DIG_RECORD_TYPES, Port, ToolResult, declared_items
 
 
 def print_tool_block(console: Console, title: str, result: ToolResult) -> None:
@@ -103,6 +103,7 @@ def print_summary(
     findings: list[dict] | None = None,
     dns_map: dict | None = None,
     tls: list[dict] | None = None,
+    declared: dict[str, dict] | None = None,
 ) -> None:
     """Print the per-host wrap-up: open ports, services, notable hits, exploits."""
     console.print()
@@ -168,6 +169,19 @@ def print_summary(
             table.add_row(hit)
         if len(hits) > 40:
             table.add_row(f"... and {len(hits) - 40} more (see artifact)")
+        console.print(table)
+
+    declared = declared or {}
+    for url, data in declared.items():
+        items = declared_items(data)
+        if not items:
+            continue
+        table = Table(title=f"declared files — {url}", title_style="bold green",
+                      header_style="bold", show_header=False)
+        table.add_column("field", style="bold")
+        table.add_column("value", overflow="fold")
+        for label, val in items:
+            table.add_row(label, val)
         console.print(table)
 
     findings = findings or []

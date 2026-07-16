@@ -26,7 +26,9 @@ from .tools import (
     GOBUSTER_INTERESTING,
     ToolRun,
     build_dns_map,
+    declared_items,
     nuclei_severity_rank,
+    parse_declared,
     parse_ffuf_structured,
     parse_gobuster_hits,
     parse_nuclei,
@@ -169,12 +171,13 @@ def build_document(
             if tr.result.ok:
                 tls.append({"port": tr.port, **parse_tls_cert(tr.result.grepable)})
             continue
-        if tr.kind in ("dir", "ffuf", "whatweb", "curl"):
+        if tr.kind in ("dir", "ffuf", "whatweb", "curl", "declared"):
             key = (tr.port, tr.vhost)
             entry = web_map.get(key)
             if entry is None:
                 entry = {"url": tr.title, "port": tr.port, "vhost": tr.vhost,
-                         "whatweb": "", "headers": {}, "gobuster": [], "ffuf": []}
+                         "whatweb": "", "headers": {}, "gobuster": [], "ffuf": [],
+                         "declared": {}}
                 web_map[key] = entry
             if not entry["url"]:
                 entry["url"] = tr.title
@@ -192,6 +195,10 @@ def build_document(
                 entry["whatweb"] = extract_whatweb(out)
             elif tr.kind == "curl":
                 entry["headers"] = extract_headers(out)
+            elif tr.kind == "declared":
+                # Parsed from the JSON in .grepable (content, not stdout — the
+                # nuclei / tls convention), attached to this (port, vhost) entry.
+                entry["declared"] = parse_declared(tr.result.grepable or "")
         elif tr.kind == "vhost":
             # Recursive vhost sweeps add more Found: lines; extend, not replace.
             for line in parse_gobuster_hits(out):
@@ -379,6 +386,11 @@ def _render_summary_text(doc: dict[str, Any]) -> str:
                 for hit in ffuf_hits:
                     size = "" if hit["size"] is None else f"  size={hit['size']}"
                     lines.append(f"      {hit['status']}  {hit['path']}{size}")
+            decl_items = declared_items(w.get("declared") or {})
+            if decl_items:
+                lines.append("    declared files:")
+                for label, val in decl_items:
+                    lines.append(f"      {label}: {val}")
         lines.append("")
 
     findings = doc.get("findings", [])
@@ -550,6 +562,13 @@ def _render_markdown(doc: dict[str, Any]) -> str:
                     lines.append(
                         f"| {_md_escape(hit['path'])} | {hit['status']} | {size} |"
                     )
+            decl_items = declared_items(w.get("declared") or {})
+            if decl_items:
+                lines.append("")
+                lines.append("**Declared files**")
+                lines.append("")
+                for label, val in decl_items:
+                    lines.append(f"- **{_md_escape(label)}:** {_md_escape(val)}")
             lines.append("")
 
     findings = doc.get("findings", [])
@@ -704,6 +723,18 @@ def _render_xml(doc: dict[str, Any]) -> str:
             ET.SubElement(ffuf_el, "hit", {
                 "path": hit["path"], "status": str(hit["status"]),
                 "size": "" if hit["size"] is None else str(hit["size"])})
+        decl = w.get("declared") or {}
+        decl_el = ET.SubElement(target_el, "declared")
+        for path in decl.get("robots_paths", []):
+            _sub(decl_el, "robotsPath", path)
+        for sitemap in decl.get("sitemaps", []):
+            _sub(decl_el, "sitemap", sitemap)
+        for loc in decl.get("sitemap_urls", []):
+            _sub(decl_el, "sitemapUrl", loc)
+        sec_el = ET.SubElement(decl_el, "security")
+        for field_name, vals in (decl.get("security") or {}).items():
+            for val in vals:
+                _sub(sec_el, "field", val, name=field_name)
 
     exploits_el = ET.SubElement(root, "exploits")
     for ex in doc.get("exploits", []):
