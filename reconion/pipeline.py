@@ -6,11 +6,17 @@ Stage flow for a single host:
       is usable (the plain nmap-only flow).
   1a. nmap full fallback (sequential): runs only when every usable fast scanner
       failed — guarantees full-range discovery.
+  1b. assumed web ports: only when no discovery stage is enabled at all (see
+      _DISCOVERY_TOGGLES) — TCP-probes the configured web_ports so the later
+      stages have somewhere to point.
+  1c. DNS zone transfer (AXFR) against the nameservers dig found.
   3.  service/version/script scan -> on the union of open ports.
-  4.  gobuster + whatweb + curl   -> in parallel, per web port.
+  4.  gobuster + whatweb + curl   -> in parallel, per web port; gobuster dns
+      (a pure DNS brute force) rides along in the same pool, port-independent.
 
-Hosts are processed one at a time by the caller; the parallelism here is
-*within* a single host.
+Which stages run is decided by the caller's toggles — see presets.py for the
+named selections the CLI offers. Hosts are processed one at a time by the
+caller; the parallelism here is *within* a single host.
 """
 
 from __future__ import annotations
@@ -66,6 +72,14 @@ DEFAULT_TOGGLES: dict[str, bool] = {
     # responses and injects the matching exclude flag into gobuster_dir / ffuf.
     "auto_calibrate": True,
 }
+
+# Stages that *find* open ports, and stages that *consume* the port list. When
+# a preset disables every discovery stage but leaves consumers on (e.g. 'fuzz'),
+# the consumers have nothing to point at — hence the assumed-web-ports fallback
+# in run_host. See presets.py.
+_DISCOVERY_TOGGLES = ("rustscan", "masscan", "nmap_quick", "nmap_full")
+_PORT_CONSUMERS = ("nmap_service", "tls_cert", "gobuster_dir", "gobuster_vhost",
+                   "ffuf", "nuclei", "whatweb", "curl", "declared_files")
 
 
 @dataclass
@@ -229,13 +243,38 @@ def run_host(
                           "detection only.[/dim]")
 
     open_ports = sorted(merged.values(), key=lambda p: p.number)
+
+    # ---- Stage 1b: assumed web ports (no discovery stage enabled) -----------
+    # A preset such as 'fuzz' skips port discovery entirely, but the stages that
+    # follow still need somewhere to point. Fall back to the configured web
+    # ports, keeping only those that answer a TCP connect so nothing runs
+    # against a dead port. Never applies when a discovery scan ran: a scan that
+    # legitimately found nothing is trusted.
+    if (not any(toggles.get(t, False) for t in _DISCOVERY_TOGGLES)
+            and any(toggles.get(t, False) for t in _PORT_CONSUMERS)):
+        assumed = _assumed_ports(config)
+        if assumed:
+            console.print("\n[bold]▶ No port discovery enabled — probing the "
+                          "configured web ports[/bold]")
+            console.print("  [dim]Candidates (config web_ports): "
+                          + ", ".join(str(n) for n in assumed) + "[/dim]")
+            open_ports = tools.probe_web_ports(host, assumed)
+            if open_ports:
+                # Recorded as a caveat so the reports say where these came from.
+                result.errors.append(
+                    "ports: no discovery scan enabled — assumed web ports "
+                    + ", ".join(f"{p.number}/{p.service}" for p in open_ports))
+            else:
+                console.print("  [yellow]None of the configured web ports "
+                              "answered.[/yellow]")
+
     if open_ports:
         console.print(
             "  Open ports: "
             + ", ".join(str(p.number) for p in open_ports)
         )
 
-    # ---- Stage 1b: DNS zone transfer (AXFR) against discovered nameservers --
+    # ---- Stage 1c: DNS zone transfer (AXFR) against discovered nameservers --
     # Depends on the NS records from the dig stage above, so it follows it.
     if toggles.get("dig", True) and domain:
         ns_hosts = tools.ns_hostnames(
@@ -335,7 +374,10 @@ def run_host(
                     "for this run.[/green]")
 
     # ---- Stage 4: web tools, per detected web port -------------------------
+    # gobuster dns is port-independent, so the stage also runs for a DNS-only
+    # selection where no port was scanned at all.
     web_ports = [p for p in open_ports if p.is_web]
+    dns_brute = bool(toggles.get("gobuster_dns", False) and domain)
     if web_ports:
         console.print(
             "  Web ports: "
@@ -344,10 +386,11 @@ def run_host(
         )
         if vhosts:
             console.print("  Virtual hosts (Host header): " + ", ".join(vhosts))
+    elif not dns_brute:
+        console.print("  [dim]No web ports detected; skipping web tools.[/dim]")
+    if web_ports or dns_brute:
         _run_web_stage(console, host, web_ports, config, toggles, domain,
                        vhosts or [], wordlists, tflags, run_dir, result)
-    else:
-        console.print("  [dim]No web ports detected; skipping web tools.[/dim]")
 
     result.findings.sort(
         key=lambda f: (tools.nuclei_severity_rank(f["severity"]), f["name"]))
@@ -377,6 +420,19 @@ def _wordlist_ok(path: str, label: str, errors: list[str]) -> bool:
     return True
 
 
+def _assumed_ports(config: dict[str, Any]) -> list[int]:
+    """Parse config['web_ports'] (space-separated) into port numbers."""
+    ports: list[int] = []
+    for tok in str(config.get("web_ports", "") or "").split():
+        try:
+            num = int(tok)
+        except ValueError:
+            continue
+        if 0 < num < 65536 and num not in ports:
+            ports.append(num)
+    return ports
+
+
 def _slug(name: str) -> str:
     """Filesystem-safe slug for a hostname (for per-vhost artifact names)."""
     return "".join(c if c.isalnum() or c in "-._" else "_" for c in name)
@@ -397,14 +453,14 @@ def _run_web_stage(
 ) -> None:
     """Run gobuster/whatweb/curl in parallel across all web ports.
 
-    Discovery modes (gobuster vhost/dns) run once against the IP. The
-    content tools (gobuster dir / whatweb / curl) run once per Host-header
-    *context*: the bare IP when no vhosts are given, otherwise one pass per
-    supplied virtual host (Host header injected, IP unchanged).
+    gobuster vhost runs once against the IP; gobuster dns is port-independent
+    (it brute-forces the domain, so it runs even with no web ports). The
+    content tools (gobuster dir / whatweb / curl / declared) run once per
+    Host-header *context*: the bare IP when no vhosts are given, otherwise one
+    pass per supplied virtual host (Host header injected, IP unchanged).
     """
     # Each job: (display_url, kind, port, vhost, callable).
     jobs: list[tuple[str, str, int | None, str | None, Callable[[], ToolResult]]] = []
-    dns_done = False
     # Each context is (host_header_or_None, filename_suffix).
     contexts: list[tuple[str | None, str]] = (
         [(vh, f"_{_slug(vh)}") for vh in vhosts] if vhosts else [(None, "")]
@@ -421,6 +477,19 @@ def _run_web_stage(
     vhost_ctx: dict[int, dict[str, Any]] = {}
     dir_seeds: list[tuple[tuple[int, str | None], str]] = []
     vhost_seeds: list[tuple[int, str]] = []
+
+    # ---- subdomain brute force: needs only the domain ----------------------
+    # Not a web-port job at all (it queries DNS, never the target's ports), so
+    # it is built outside the port loop and runs even when no port is open —
+    # the DNS-only preset is exactly that case. It shares this pool because it
+    # is slow and has nothing to wait for.
+    if toggles.get("gobuster_dns", False) and domain:
+        wl = wordlists.get("dns", "")
+        if _wordlist_ok(wl, "gobuster_dns", result.errors):
+            jobs.append((f"dns:{domain}", "dns", None, None, lambda wl=wl:
+                         tools.gobuster_dns(
+                             domain, wl, run_dir / "gobuster_dns.txt",
+                             extra=tflags.get("gobuster", ""))))
 
     for p in web_ports:
         scheme = "https" if p.is_https else "http"
@@ -440,15 +509,6 @@ def _run_web_stage(
                 if recurse_on:
                     vhost_ctx[p.number] = {
                         "ip_url": ip_url, "insecure": insecure, "wordlist": wl}
-
-        if toggles.get("gobuster_dns", False) and domain and not dns_done:
-            wl = wordlists.get("dns", "")
-            if _wordlist_ok(wl, "gobuster_dns", result.errors):
-                dns_done = True
-                jobs.append((f"dns:{domain}", "dns", None, None, lambda wl=wl:
-                             tools.gobuster_dns(
-                                 domain, wl, run_dir / "gobuster_dns.txt",
-                                 extra=tflags.get("gobuster", ""))))
 
         # ---- content tools: once per Host-header context --------------------
         for host_header, suffix in contexts:
@@ -520,7 +580,7 @@ def _run_web_stage(
     if not jobs:
         return
 
-    console.print("\n[bold]▶ Web enumeration — gobuster / whatweb / curl / "
+    console.print("\n[bold]▶ Enumeration — gobuster / whatweb / curl / "
                   "declared (parallel)[/bold]")
     with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
         futures = {ex.submit(fn): (url, kind, port, vhost)

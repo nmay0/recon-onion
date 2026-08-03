@@ -16,6 +16,8 @@ import json
 import random
 import re
 import shutil
+import socket
+import ssl
 import string
 import subprocess
 from dataclasses import dataclass, field
@@ -362,6 +364,43 @@ def parse_rustscan(text: str) -> list[Port]:
                 continue
             found.setdefault(num, Port(number=num, proto="tcp"))
     return [found[n] for n in sorted(found)]
+
+
+# How long to wait for the fallback probe's TCP connect / TLS handshake.
+_PROBE_TIMEOUT = 1.5
+
+
+def probe_web_ports(host: str, ports: list[int],
+                    timeout: float = _PROBE_TIMEOUT) -> list[Port]:
+    """TCP-connect to *ports* and return those that answer, as web Ports.
+
+    Used only when no port-discovery stage is enabled (e.g. the 'fuzz' preset):
+    the web stages still need somewhere to point, and a plain connect tells an
+    open port from a closed/filtered one without running a scanner. http vs
+    https is decided by attempting a TLS handshake rather than by port number,
+    so a service on a non-standard port still gets the right scheme.
+    """
+    found: list[Port] = []
+    for number in ports:
+        try:
+            sock = socket.create_connection((host, number), timeout)
+        except OSError:
+            continue
+        service = "http"
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            # Handshake only — we want the protocol, not the certificate
+            # (tls_cert does that properly).
+            ctx.wrap_socket(sock, server_hostname=host).close()
+            service = "https"
+        except (OSError, ValueError):
+            pass
+        finally:
+            sock.close()
+        found.append(Port(number=number, proto="tcp", service=service))
+    return found
 
 
 # --------------------------------------------------------------------------- #

@@ -52,6 +52,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "never",
         "max_depth": "2",
     },
+    # Web ports assumed when no port-discovery stage is enabled (e.g. the
+    # 'fuzz' preset). Space-separated; each is TCP-probed and only the ones
+    # that answer are used, so the web stages have somewhere to point without
+    # running a scanner. Ignored whenever a discovery scan runs.
+    "web_ports": "80 443 8080 8443",
     # Root output directory; runs land under <output_dir>/<host>/<timestamp>/.
     "output_dir": "./recon",
     # Extra flags appended per tool/stage (a single string each, split on spaces).

@@ -22,6 +22,7 @@ from .config import (
 )
 from .output import print_tool_block
 from .pipeline import DEFAULT_TOGGLES, run_host
+from .presets import PRESETS, enabled_stages, profile_name
 from .report import REPORT_FORMATS
 
 # Tools checked at startup. Opt-in tools (ffuf, nuclei) and tools that degrade
@@ -70,11 +71,58 @@ def parse_target(raw: str) -> tuple[str | None, list[str], str | None]:
 
 
 # --------------------------------------------------------------------------- #
+# Presets (pipeline profiles)
+# --------------------------------------------------------------------------- #
+
+def choose_preset(console: Console,
+                  current: dict[str, bool]) -> dict[str, bool] | None:
+    """Show the presets and return the chosen one's toggles (None = keep current)."""
+    table = Table(title="Pipeline presets", title_style="bold cyan",
+                  header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("Preset")
+    table.add_column("What it answers", overflow="fold")
+    table.add_column("Stages", overflow="fold", style="dim")
+    for i, preset in enumerate(PRESETS, start=1):
+        active = " [green](active)[/green]" if preset.toggles() == current else ""
+        table.add_row(str(i), preset.label + active, preset.description,
+                      preset.stage_summary())
+    console.print(table)
+    raw = Prompt.ask(
+        "Preset # (or [bold]Enter[/bold] to keep the current selection)",
+        default="").strip()
+    if not raw:
+        return None
+    if not raw.isdigit() or not (1 <= int(raw) <= len(PRESETS)):
+        console.print("[yellow]Invalid selection; keeping current stages.[/yellow]")
+        return None
+    return PRESETS[int(raw) - 1].toggles()
+
+
+def preset_flow(console: Console, session: Session) -> None:
+    console.print(Panel(
+        "A preset picks which pipeline stages run, so you can skip everything "
+        "a run doesn't need. Session-only — [bold]never[/bold] saved to config; "
+        "fine-tune afterwards in 'Modify run'.", border_style="cyan"))
+    chosen = choose_preset(console, session.toggles)
+    if chosen is None:
+        console.print(f"[dim]Unchanged — {profile_name(session.toggles)}.[/dim]")
+        return
+    session.toggles = chosen
+    console.print(f"[green]Preset applied:[/green] "
+                  f"{profile_name(session.toggles)} — "
+                  + ", ".join(enabled_stages(session.toggles)))
+    session.domain = _maybe_domain(console, session.toggles, session.domain)
+
+
+# --------------------------------------------------------------------------- #
 # Toggle editing (shared by 'Modify run' and per-host CIDR prompts)
 # --------------------------------------------------------------------------- #
 
 def _toggle_table(toggles: dict[str, bool]) -> Table:
-    table = Table(show_header=True, header_style="bold")
+    table = Table(title=f"Pipeline profile: {profile_name(toggles)}",
+                  title_style="bold cyan", show_header=True,
+                  header_style="bold")
     table.add_column("#", justify="right")
     table.add_column("Tool / stage")
     table.add_column("Enabled")
@@ -91,11 +139,17 @@ def edit_toggles(console: Console, toggles: dict[str, bool]) -> dict[str, bool]:
     while True:
         console.print(_toggle_table(working))
         raw = Prompt.ask(
-            "Toggle which # (comma-separated), or [bold]Enter[/bold] to accept",
+            "Toggle which # (comma-separated), [bold]p[/bold]=load a preset, "
+            "or [bold]Enter[/bold] to accept",
             default="",
         ).strip()
         if not raw:
             return working
+        if raw.lower() == "p":
+            chosen = choose_preset(console, working)
+            if chosen is not None:
+                working = chosen
+            continue
         for tok in raw.split(","):
             tok = tok.strip()
             if not tok.isdigit() or not (1 <= int(tok) <= len(keys)):
@@ -182,6 +236,8 @@ def _run_target(
     entries are purely a convenience for other tools/browsers, so they're
     opt-in and removed again on request.
     """
+    console.print(f"[dim]Pipeline: {profile_name(toggles)} — "
+                  + ", ".join(enabled_stages(toggles)) + "[/dim]")
     added: list[str] = []
     if vhosts:
         added = hosts.add_entries(console, ip, vhosts)
@@ -321,6 +377,7 @@ EDITABLE_FIELDS: list[tuple[str, list[str]]] = [
     ("nmap timing flag", ["nmap_timing"]),
     ("privileged prefix (e.g. sudo, for masscan)", ["privileged_prefix"]),
     ("output directory", ["output_dir"]),
+    ("web ports assumed when no port scan runs", ["web_ports"]),
     ("dns record types", ["dns", "record_types"]),
     ("gobuster recursion mode (never/prompt/always)", ["recursion", "mode"]),
     ("gobuster recursion max depth", ["recursion", "max_depth"]),
@@ -438,23 +495,28 @@ def main() -> None:
 
     actions = {
         "1": "Run",
-        "2": "Edit config",
-        "3": "Modify run (session toggles)",
-        "4": "Quit",
+        "2": "Preset (pick which stages run)",
+        "3": "Edit config",
+        "4": "Modify run (session toggles)",
+        "5": "Quit",
     }
     while True:
         console.print()
         table = Table(show_header=False, box=None)
         for key, label in actions.items():
-            table.add_row(f"[bold cyan]{key}[/bold cyan]", label)
+            marker = (f" [dim](current: {profile_name(session.toggles)})[/dim]"
+                      if key == "2" else "")
+            table.add_row(f"[bold cyan]{key}[/bold cyan]", label + marker)
         console.print(table)
         choice = Prompt.ask("Select", choices=list(actions), default="1")
         if choice == "1":
             run_flow(console, session)
         elif choice == "2":
-            edit_config_flow(console)
+            preset_flow(console, session)
         elif choice == "3":
-            modify_run_flow(console, session)
+            edit_config_flow(console)
         elif choice == "4":
+            modify_run_flow(console, session)
+        elif choice == "5":
             console.print("Bye.")
             return

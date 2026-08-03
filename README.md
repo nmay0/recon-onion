@@ -33,7 +33,9 @@ For each target host, in stages (some parallel, some dependent):
    yourself).
 5. **Web enumeration** — for every detected web port, `gobuster dir` + `whatweb` +
    `curl -I` (and `ffuf` / `nuclei`, if enabled) run *in parallel*, once per
-   Host-header context. Discovered directories/virtual hosts are then recursed
+   Host-header context. `gobuster dns` (subdomain brute force) shares the pool
+   but is port-independent — it runs off the domain alone. Discovered
+   directories/virtual hosts are then recursed
    into (see [Recursive enumeration](#recursive-enumeration)).
    - HTTPS-aware: `https://` scheme for gobuster/whatweb and `-k` for curl on
      443/8443 (or any `ssl`/`https` service), so self-signed certs don't break.
@@ -42,11 +44,15 @@ For each target host, in stages (some parallel, some dependent):
      the results aren't drowned in identical noise.
 
 Default-on stages: rustscan, the nmap service scan, whois, dig, TLS, searchsploit,
-`gobuster dir`, whatweb, curl. Opt-in (enable via *Modify run* or the per-host
-CIDR prompt): masscan, ffuf, nuclei, `gobuster dns`/`vhost`. Recursion is off by
+`gobuster dir`, whatweb, curl, declared files. Opt-in (enable via *Modify run* or
+the per-host CIDR prompt): masscan, ffuf, nuclei, `gobuster dns`/`vhost`.
+Recursion is off by
 default too, switched on in *Edit config* (see [Recursive enumeration](#recursive-enumeration)).
 `searchsploit` only runs when the service scan produced results; `nuclei` is
 scoped to detection/version-CVE templates (it never acts on the target).
+
+Not every run needs every stage — **presets** (menu option 2) select a subset,
+e.g. DNS recon or directory fuzzing alone. See [Presets](#presets).
 
 CIDR ranges run an `nmap -sn` discovery sweep first, then **pause** so you can
 review the live hosts and exclude any before enumeration. Each kept host is then
@@ -97,10 +103,41 @@ Menu:
 - **1. Run** — prompts for an IP or CIDR, then which config (default/custom),
   then runs the pipeline. For a CIDR it sweeps → lets you exclude hosts →
   prompts config + toggles per kept host.
-- **2. Edit config** — edit the custom config; only values that differ from the
+- **2. Preset** — pick which stages run (see [Presets](#presets)). The menu shows
+  the active profile.
+- **3. Edit config** — edit the custom config; only values that differ from the
   defaults are saved (to `./recon_config.json`).
-- **3. Modify run** — toggle which tools run this session. Session-only; never
+- **4. Modify run** — toggle which tools run this session. Session-only; never
   saved to config.
+
+### Presets
+
+A preset is a named stage selection, so you don't have to run the whole pipeline
+to do one thing. Pick one in **2. Preset** (or with `p` inside the toggle
+editor):
+
+| Preset | Answers | Stages |
+| --- | --- | --- |
+| **Full pipeline** | everything (the default) | all default-on stages |
+| **Initial recon** | *what is this host?* | rustscan (+nmap discovery fallback), nmap service scan, TLS certs, searchsploit, whatweb, curl |
+| **DNS recon** | *what does DNS say?* | whois, dig records + PTR, AXFR, `gobuster dns` |
+| **Content discovery** | *what content is exposed?* | `gobuster dir` + catch-all calibration |
+
+Presets are **session-only** (never saved to config) and are a starting point,
+not a straitjacket: flip individual stages afterwards in *Modify run* and the
+profile is reported as `custom`. A preset is a whitelist — any stage it doesn't
+name is off, so a stage added in a future version never quietly joins a narrow
+preset.
+
+Two stages adapt so the narrow presets still work standalone:
+
+- `gobuster dns` runs off the domain alone, so **DNS recon** enumerates
+  subdomains even though it never scans a port.
+- **Content discovery** has no port scan to tell it where the web servers are,
+  so it TCP-probes the configured `web_ports` (default `80 443 8080 8443`) and
+  uses the ones that answer — https vs http is decided by an actual TLS
+  handshake, so non-standard ports get the right scheme. The reports note that
+  those ports were assumed rather than scanned.
 
 ### gobuster modes
 
@@ -165,6 +202,7 @@ your overrides** and missing keys fall back to defaults automatically.
 | `nmap_timing` | `-T4` |
 | `output_dir` | `./recon` |
 | `privileged_prefix` | empty (set to `sudo` to run `masscan` privileged) |
+| `web_ports` | `80 443 8080 8443` (assumed only when no port scan runs — see [Presets](#presets)) |
 | `dns.record_types` | `A AAAA NS SOA MX TXT CNAME` |
 | `wordlists.dir` / `wordlists.ffuf` | `/usr/share/wordlists/dirb/common.txt` |
 | `wordlists.dns` / `wordlists.vhost` | seclists subdomains top-5000 |
@@ -197,6 +235,7 @@ recon/<target-ip>/<timestamp>/
   gobuster_dir_<port>[_<vhost>][_<path>].txt  gobuster_vhost_<port>.txt  gobuster_dns.txt
   ffuf_<port>[_<vhost>].txt  nuclei_<port>[_<vhost>].txt
   whatweb_<port>[_<vhost>].txt  curl_<port>[_<vhost>].txt
+  declared_<port>[_<vhost>].txt                        # robots.txt / sitemap.xml / security.txt
   report.txt  report.raw.txt  report.json  report.xml  report.md  # consolidated
 ```
 
