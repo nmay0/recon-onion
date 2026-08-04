@@ -119,6 +119,16 @@ def preset_flow(console: Console, session: Session) -> None:
 # Toggle editing (shared by 'Modify run' and per-host CIDR prompts)
 # --------------------------------------------------------------------------- #
 
+# Short caveats for stages whose default state needs explaining — shown dim in
+# the toggle table so the user knows what turning one on actually means.
+_TOGGLE_NOTES = {
+    "rustscan": "aggressive: much faster packet rate than nmap; replaces the "
+                "nmap discovery scans",
+    "masscan": "aggressive: needs root (privileged_prefix), rate-capped in "
+               "config; replaces the nmap discovery scans",
+}
+
+
 def _toggle_table(toggles: dict[str, bool]) -> Table:
     table = Table(title=f"Pipeline profile: {profile_name(toggles)}",
                   title_style="bold cyan", show_header=True,
@@ -126,9 +136,11 @@ def _toggle_table(toggles: dict[str, bool]) -> Table:
     table.add_column("#", justify="right")
     table.add_column("Tool / stage")
     table.add_column("Enabled")
+    table.add_column("Notes", style="dim", overflow="fold")
     for i, (key, val) in enumerate(toggles.items(), start=1):
         table.add_row(str(i), key,
-                      "[green]on[/green]" if val else "[red]off[/red]")
+                      "[green]on[/green]" if val else "[red]off[/red]",
+                      _TOGGLE_NOTES.get(key, ""))
     return table
 
 

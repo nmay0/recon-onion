@@ -1,11 +1,11 @@
 """Per-host pipeline orchestration.
 
 Stage flow for a single host:
-  1.  initial recon burst (parallel): the primary fast scanner (rustscan/
-      masscan) + DNS. nmap quick+full join the burst only when no fast scanner
-      is usable (the plain nmap-only flow).
-  1a. nmap full fallback (sequential): runs only when every usable fast scanner
-      failed — guarantees full-range discovery.
+  1.  initial recon burst (parallel): nmap quick+full (the default discovery
+      path) + DNS. The opt-in fast scanners (rustscan/masscan) take over as the
+      primary port discovery when enabled, and nmap's discovery scans step aside.
+  1a. nmap full fallback (sequential): runs only when an enabled fast scanner
+      was tried and none succeeded — guarantees full-range discovery.
   1b. assumed web ports: only when no discovery stage is enabled at all (see
       _DISCOVERY_TOGGLES) — TCP-probes the configured web_ports so the later
       stages have somewhere to point.
@@ -40,17 +40,19 @@ _RECURSION_MAX_SCANS = 50
 
 # Toggle keys, all default-on except the optional gobuster modes and ffuf.
 DEFAULT_TOGGLES: dict[str, bool] = {
-    # nmap_quick/full are the nmap *discovery* path; they run only when there's
-    # no usable fast scanner (then both run as primary in the burst), with
-    # nmap_full also the sequential fallback if a fast scanner fails (see
-    # run_host). A successful rustscan/masscan covers every port, so both nmap
-    # discovery scans are skipped and nmap is used for service detection only.
+    # nmap is the default port-discovery path: gentle, well-behaved traffic.
+    # Both run as primary in the burst; nmap_full doubles as the sequential
+    # fallback when an enabled fast scanner fails (see run_host).
     "nmap_quick": True,
     "nmap_full": True,
-    # rustscan is the default primary full-range discovery (fast, rootless).
-    # masscan is opt-in (needs root / config privileged_prefix). Either feeds
-    # the same port union, then nmap_service does version/script detection.
-    "rustscan": True,
+    # Fast scanners: both OPT-IN. They fire packets far more aggressively than
+    # nmap and can disrupt fragile hosts/networks, so the user chooses them
+    # deliberately. When one is enabled it becomes the primary full-range
+    # discovery and nmap's discovery scans stand down (a successful fast scan
+    # already covered every port); nmap then runs for service/version only.
+    # rustscan is rootless; masscan needs root (config privileged_prefix) and is
+    # rate-capped via tool_flags. Either feeds the same port union.
+    "rustscan": False,
     "masscan": False,
     "nmap_service": True,
     "whois": True,
@@ -155,10 +157,11 @@ def run_host(
     # is (name, kind, title, callable); the kind routes how its result is used.
     scan_groups: list[list[Port]] = []
     record_types = (config.get("dns", {}).get("record_types") or "").split()
-    # Fast scanners are the primary full-range discovery; nmap_full is held back
-    # as a fallback (run sequentially below) that only fires when every usable
-    # fast scanner fails. With no fast scanner installed+enabled, nmap_full runs
-    # as the primary inside the parallel burst (the plain nmap-only flow).
+    # nmap quick+full are the default discovery, running as primary inside the
+    # parallel burst. If the user opted into a fast scanner and it is installed,
+    # that takes over as the primary full-range discovery instead: nmap_quick is
+    # dropped and nmap_full is held back as a sequential fallback (below) that
+    # only fires when every enabled fast scanner fails.
     fast_toggles = ("rustscan", "masscan")
     fast_available = any(
         toggles.get(t, False) and tools.tool_available(t) for t in fast_toggles)
@@ -171,7 +174,7 @@ def run_host(
         init_jobs.append(("nmap_full", "scan", "nmap_full", lambda:
             tools.nmap_full(host, run_dir / "nmap_full.txt", timing=timing,
                             extra=tflags.get("nmap_full", ""))))
-    if toggles.get("rustscan", True):
+    if toggles.get("rustscan", False):
         init_jobs.append(("rustscan", "scan", "rustscan", lambda:
             tools.rustscan(host, run_dir / "rustscan.txt",
                            extra=tflags.get("rustscan", ""))))
@@ -218,10 +221,10 @@ def run_host(
     merged = _merge_ports(*scan_groups)
 
     # ---- Stage 1a: nmap_full fallback --------------------------------------
-    # If a usable fast scanner was tried but none succeeded, fall back to nmap
-    # -p- so a fast-scanner failure (crash, no root, ...) never costs us
-    # full-range discovery. If a fast scanner did succeed, the held-back
-    # nmap_full is unnecessary and stays skipped.
+    # Only reachable when the user opted into a fast scanner. If one was tried
+    # but none succeeded, fall back to nmap -p- so a fast-scanner failure (crash,
+    # no root, ...) never costs us full-range discovery. If a fast scanner did
+    # succeed, the held-back nmap_full is unnecessary and stays skipped.
     if fast_available and toggles.get("nmap_full", True):
         fast_ok = any(tr.result.ok for tr in result.tool_runs
                       if tr.name in fast_toggles)

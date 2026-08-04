@@ -13,12 +13,14 @@ CLI.
 For each target host, in stages (some parallel, some dependent):
 
 1. **Port discovery + DNS (parallel burst).**
-   - *Ports:* `rustscan` sweeps all 65535 TCP ports (fast, rootless) by default;
-     `masscan` is an opt-in alternative (needs root — see `privileged_prefix`).
-     If no fast scanner is usable, `nmap -F` + `nmap -p-` run as the primary
-     discovery instead. Open ports from whatever ran feed one union. If a fast
-     scanner was tried but failed, `nmap -p-` runs as a fallback so full-range
-     discovery is never lost.
+   - *Ports:* `nmap -F` + `nmap -p-` are the default discovery — gentle,
+     well-behaved traffic. The fast scanners `rustscan` (rootless) and `masscan`
+     (needs root — see `privileged_prefix`) are **opt-in**: they sweep all 65535
+     ports far quicker but at a much more aggressive packet rate, so you enable
+     them deliberately. Enabling one makes it the primary discovery and the nmap
+     discovery scans stand down; if it was tried but failed, `nmap -p-` runs as a
+     fallback so full-range discovery is never lost. Open ports from whatever ran
+     feed one union.
    - *DNS infrastructure:* `whois` (target IP, plus the domain if you give one)
      and `dig` (forward records + reverse PTR) run alongside the port scan; a
      `dig AXFR` zone-transfer attempt then follows against each discovered
@@ -43,9 +45,9 @@ For each target host, in stages (some parallel, some dependent):
      detects catch-all ("wildcard") servers and injects the matching filter so
      the results aren't drowned in identical noise.
 
-Default-on stages: rustscan, the nmap service scan, whois, dig, TLS, searchsploit,
+Default-on stages: the nmap port + service scans, whois, dig, TLS, searchsploit,
 `gobuster dir`, whatweb, curl, declared files. Opt-in (enable via *Modify run* or
-the per-host CIDR prompt): masscan, ffuf, nuclei, `gobuster dns`/`vhost`.
+the per-host CIDR prompt): rustscan, masscan, ffuf, nuclei, `gobuster dns`/`vhost`.
 Recursion is off by
 default too, switched on in *Edit config* (see [Recursive enumeration](#recursive-enumeration)).
 `searchsploit` only runs when the service scan produced results; `nuclei` is
@@ -79,9 +81,9 @@ sudo apt install nmap gobuster ffuf whatweb exploitdb curl seclists \
 
 (`exploitdb` provides `searchsploit`; `seclists` provides the dns/vhost
 wordlists; `dnsutils` provides `dig`. On Kali most of these ship preinstalled.
-`rustscan` (the default fast scanner) and `nuclei` (opt-in) aren't in apt —
-install them from their own releases; if `rustscan` is absent recon onion falls
-back to `nmap`, and `nuclei`/`ffuf`/`masscan` are simply skipped unless enabled.)
+`rustscan` and `nuclei` aren't in apt — install them from their own releases.
+All of `rustscan`/`masscan`/`nuclei`/`ffuf` are opt-in and simply skipped unless
+enabled; port discovery uses `nmap` by default either way.)
 
 ## Run
 
@@ -119,7 +121,7 @@ editor):
 | Preset | Answers | Stages |
 | --- | --- | --- |
 | **Full pipeline** | everything (the default) | all default-on stages |
-| **Initial recon** | *what is this host?* | rustscan (+nmap discovery fallback), nmap service scan, TLS certs, searchsploit, whatweb, curl |
+| **Initial recon** | *what is this host?* | nmap port discovery, nmap service scan, TLS certs, searchsploit, whatweb, curl |
 | **DNS recon** | *what does DNS say?* | whois, dig records + PTR, AXFR, `gobuster dns` |
 | **Content discovery** | *what content is exposed?* | `gobuster dir` + catch-all calibration |
 

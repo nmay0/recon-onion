@@ -52,7 +52,7 @@ PRESETS: tuple[Preset, ...] = (
         "What is this host? Port discovery, service/version detection, TLS "
         "certs, HTTP fingerprint and the offline exploit search. No brute "
         "forcing of any kind.",
-        ("rustscan", "nmap_quick", "nmap_full", "nmap_service", "tls_cert",
+        ("nmap_quick", "nmap_full", "nmap_service", "tls_cert",
          "searchsploit", "whatweb", "curl"),
     ),
     Preset(

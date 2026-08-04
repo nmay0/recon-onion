@@ -288,9 +288,11 @@ def parse_grepable_ports(stdout: str) -> list[Port]:
 # Speed-oriented alternatives to nmap's port discovery: they sweep all 65535
 # TCP ports far faster than `nmap -p-`, then hand the open ports to the existing
 # nmap_service stage for version/script detection (kept as the single source of
-# service data). rustscan is the default primary full-range discovery; the
-# pipeline holds nmap_full back as a fallback that runs only if the fast
-# scanner(s) fail (see run_host).
+# service data). That speed comes from a much more aggressive packet rate than
+# nmap's, which fragile hosts and network gear may not take kindly to, so BOTH
+# are opt-in — nmap is the default discovery path. When the user enables one it
+# becomes the primary full-range discovery and the pipeline holds nmap_full back
+# as a fallback that runs only if the fast scanner(s) fail (see run_host).
 
 
 def rustscan(target: str, artifact: Path, *, extra: str) -> ToolResult:
