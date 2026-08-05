@@ -139,6 +139,29 @@ def load_overrides(path: Path = CONFIG_PATH) -> dict[str, Any]:
         return {}
 
 
+def override_error(path: Path = CONFIG_PATH) -> str | None:
+    """Return a message if the override file exists but cannot be used.
+
+    load_overrides() deliberately degrades to {} so a bad file never crashes a
+    run — but silently reverting every override (output_dir included) is worse
+    than useless when the user believes their config is in effect. The CLI calls
+    this to say so out loud. Returns None when the file is absent or usable.
+    """
+    if not path.exists():
+        return None
+    where = path.resolve()
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        return f"{where} is not valid JSON ({exc}); every override was ignored."
+    except OSError as exc:
+        return f"{where} could not be read ({exc}); every override was ignored."
+    if not isinstance(data, dict):
+        return f"{where} must contain a JSON object; every override was ignored."
+    return None
+
+
 def load_config(use_custom: bool, path: Path = CONFIG_PATH) -> dict[str, Any]:
     """Return the effective config.
 

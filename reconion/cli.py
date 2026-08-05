@@ -18,6 +18,7 @@ from .config import (
     CONFIG_PATH,
     DEFAULT_CONFIG,
     load_config,
+    override_error,
     save_custom_config,
 )
 from .output import print_tool_block
@@ -269,9 +270,28 @@ def _run_target(
 
 def _ask_config(console: Console, label: str = "Config") -> dict[str, Any]:
     choice = Prompt.ask(f"{label}", choices=["default", "custom"], default="default")
-    if choice == "custom" and not CONFIG_PATH.exists():
-        console.print("[yellow]No custom config saved yet; using defaults.[/yellow]")
-    return load_config(choice == "custom")
+    # CONFIG_PATH is relative, so it is only found when the working directory is
+    # the one the config was saved from. Every way of ending up on the defaults
+    # used to be silent, which made a customised output_dir look like it had
+    # been ignored at random — say which config is actually in force instead.
+    if choice == "custom":
+        if not CONFIG_PATH.exists():
+            console.print(
+                f"[yellow]No custom config at {CONFIG_PATH.resolve()} — "
+                f"using defaults.[/yellow]")
+        else:
+            problem = override_error()
+            if problem:
+                console.print(f"[red]! {problem}[/red]")
+    elif CONFIG_PATH.exists():
+        console.print(
+            f"[yellow]Note: a custom config exists at {CONFIG_PATH.resolve()} "
+            f"but 'default' was chosen — its overrides are not in effect.[/yellow]")
+
+    config = load_config(choice == "custom")
+    out = Path(config.get("output_dir", "./recon")).expanduser().resolve()
+    console.print(f"[dim]Output directory: {out}[/dim]")
+    return config
 
 
 def _sweep_live_hosts(console: Console, network: str,

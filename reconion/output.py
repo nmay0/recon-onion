@@ -43,9 +43,14 @@ def print_tool_block(console: Console, title: str, result: ToolResult) -> None:
 
 
 def make_run_dir(output_dir: str, host: str) -> Path:
-    """Create and return recon/<host>/<timestamp>/ — unique per run, never overwrites."""
+    """Create and return recon/<host>/<timestamp>/ — unique per run, never overwrites.
+
+    The path is resolved to an absolute one: output_dir defaults to the relative
+    "./recon", so a bare relative path printed back to the user is unfindable
+    unless they happen to know the process's working directory.
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(output_dir).expanduser() / host / timestamp
+    run_dir = (Path(output_dir).expanduser() / host / timestamp).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
