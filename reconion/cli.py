@@ -10,7 +10,6 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from . import hosts, tools
@@ -19,11 +18,13 @@ from .config import (
     DEFAULT_CONFIG,
     load_config,
     override_error,
+    override_notice,
     save_custom_config,
 )
 from .output import print_tool_block
 from .pipeline import DEFAULT_TOGGLES, run_host
 from .presets import PRESETS, enabled_stages, profile_name
+from .prompts import ask as _ask, confirm as _confirm
 from .report import REPORT_FORMATS
 
 # Tools checked at startup. Opt-in tools (ffuf, nuclei) and tools that degrade
@@ -89,7 +90,7 @@ def choose_preset(console: Console,
         table.add_row(str(i), preset.label + active, preset.description,
                       preset.stage_summary())
     console.print(table)
-    raw = Prompt.ask(
+    raw = _ask(
         "Preset # (or [bold]Enter[/bold] to keep the current selection)",
         default="").strip()
     if not raw:
@@ -151,7 +152,7 @@ def edit_toggles(console: Console, toggles: dict[str, bool]) -> dict[str, bool]:
     keys = list(working.keys())
     while True:
         console.print(_toggle_table(working))
-        raw = Prompt.ask(
+        raw = _ask(
             "Toggle which # (comma-separated), [bold]p[/bold]=load a preset, "
             "or [bold]Enter[/bold] to accept",
             default="",
@@ -190,7 +191,7 @@ def edit_output_formats(console: Console,
                           "[green]on[/green]" if working.get(key)
                           else "[red]off[/red]")
         console.print(table)
-        raw = Prompt.ask(
+        raw = _ask(
             "Toggle which # (comma-separated), or [bold]Enter[/bold] to accept",
             default="",
         ).strip()
@@ -216,7 +217,7 @@ def _maybe_domain(console: Console, toggles: dict[str, bool],
     if (toggles.get("dig") or toggles.get("gobuster_dns")
             or toggles.get("gobuster_vhost")):
         dflt = current or ""
-        val = Prompt.ask(
+        val = _ask(
             "Domain for DNS recon / gobuster dns/vhost (blank to skip)",
             default=dflt,
         ).strip()
@@ -226,7 +227,7 @@ def _maybe_domain(console: Console, toggles: dict[str, bool],
 
 def _prompt_vhosts(console: Console, default: list[str]) -> list[str]:
     """Ask for virtual-host names to enumerate via Host-header injection."""
-    raw = Prompt.ask(
+    raw = _ask(
         "Virtual host name(s) for Host-header enum (comma-separated, blank = none)",
         default=",".join(default),
     ).strip()
@@ -257,7 +258,7 @@ def _run_target(
     try:
         run_host(console, ip, config, toggles, domain, vhosts)
     finally:
-        if added and Confirm.ask(
+        if added and _confirm(
             f"Remove the {len(added)} /etc/hosts entry(ies) added for {ip}?",
             default=True,
         ):
@@ -269,7 +270,7 @@ def _run_target(
 # --------------------------------------------------------------------------- #
 
 def _ask_config(console: Console, label: str = "Config") -> dict[str, Any]:
-    choice = Prompt.ask(f"{label}", choices=["default", "custom"], default="default")
+    choice = _ask(f"{label}", choices=["default", "custom"], default="default")
     # CONFIG_PATH is relative, so it is only found when the working directory is
     # the one the config was saved from. Every way of ending up on the defaults
     # used to be silent, which made a customised output_dir look like it had
@@ -283,6 +284,9 @@ def _ask_config(console: Console, label: str = "Config") -> dict[str, Any]:
             problem = override_error()
             if problem:
                 console.print(f"[red]! {problem}[/red]")
+            notice = override_notice()
+            if notice:
+                console.print(f"[yellow]! {notice}[/yellow]")
     elif CONFIG_PATH.exists():
         console.print(
             f"[yellow]Note: a custom config exists at {CONFIG_PATH.resolve()} "
@@ -317,7 +321,7 @@ def _select_hosts(console: Console, live: list[str]) -> list[str]:
     for i, h in enumerate(live, start=1):
         table.add_row(str(i), h)
     console.print(table)
-    raw = Prompt.ask(
+    raw = _ask(
         "Hosts to [bold red]EXCLUDE[/bold red] (comma-separated #, blank = keep all)",
         default="",
     ).strip()
@@ -334,8 +338,8 @@ def _select_hosts(console: Console, live: list[str]) -> list[str]:
 def run_flow(console: Console, session: Session) -> None:
     # The prompt defaults to the last target so repeat runs (e.g. after a config
     # tweak) need no retyping; delete it and type a new one to change targets.
-    raw = Prompt.ask("Target [bold]IP or CIDR[/bold]",
-                     default=session.target or "").strip()
+    raw = _ask("Target [bold]IP or CIDR[/bold]",
+               default=session.target or "").strip()
     if not raw:
         return
     single, range_hosts, err = parse_target(raw)
@@ -377,7 +381,7 @@ def run_flow(console: Console, session: Session) -> None:
     for host in kept:
         console.rule(f"[bold]Configure {host}[/bold]")
         config = _ask_config(console, label=f"Config for {host}")
-        if Confirm.ask(f"Adjust tool toggles for {host}?", default=False):
+        if _confirm(f"Adjust tool toggles for {host}?", default=False):
             toggles = edit_toggles(console, session.toggles)
         else:
             toggles = copy.deepcopy(session.toggles)
@@ -461,7 +465,7 @@ def edit_config_flow(console: Console) -> None:
             "[bold]Output formats[/bold] ([cyan]o[/cyan] to edit): "
             + (", ".join(enabled) if enabled else "[yellow]none[/yellow]"))
 
-        raw = Prompt.ask(
+        raw = _ask(
             "Edit which # ([bold]o[/bold]=formats, [bold]s[/bold]=save, "
             "[bold]q[/bold]=cancel)",
             default="s").strip().lower()
@@ -486,7 +490,7 @@ def edit_config_flow(console: Console) -> None:
             continue
         label, path = EDITABLE_FIELDS[int(raw) - 1]
         current = str(_get_nested(cfg, path))
-        new = Prompt.ask(f"New value for [bold]{label}[/bold]", default=current)
+        new = _ask(f"New value for [bold]{label}[/bold]", default=current)
         _set_nested(cfg, path, new)
 
 
@@ -540,7 +544,7 @@ def main() -> None:
                       if key == "2" else "")
             table.add_row(f"[bold cyan]{key}[/bold cyan]", label + marker)
         console.print(table)
-        choice = Prompt.ask("Select", choices=list(actions), default="1")
+        choice = _ask("Select", choices=list(actions), default="1")
         if choice == "1":
             run_flow(console, session)
         elif choice == "2":

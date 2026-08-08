@@ -14,7 +14,8 @@ import subprocess
 from pathlib import Path
 
 from rich.console import Console
-from rich.prompt import Confirm
+
+from .prompts import confirm
 
 HOSTS_PATH = Path("/etc/hosts")
 # Tag appended to lines we add, so cleanup only ever touches our own entries.
@@ -58,7 +59,7 @@ def add_entries(
         f"[yellow]These names don't resolve to {ip}:[/yellow] "
         + ", ".join(needed)
     )
-    if not assume_yes and not Confirm.ask(
+    if not assume_yes and not confirm(
         f"Add them to {HOSTS_PATH} (needs sudo)?", default=False
     ):
         console.print("[dim]Skipping /etc/hosts; header injection still applies.[/dim]")

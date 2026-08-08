@@ -9,11 +9,60 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 # Where the custom (override-only) config lives.
 CONFIG_PATH = Path("./recon_config.json")
+
+# ANSI escape sequences (CSI form plus the two-character form), e.g. the arrow
+# keys, which arrive as literal bytes when the terminal is not editing the line.
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def sanitize_text(raw: str) -> str:
+    """Return *raw* with terminal line-editing keys applied and control bytes dropped.
+
+    A prompt answer can arrive with raw editing bytes still in it when the
+    terminal's ERASE character and the key the keyboard actually sends disagree
+    (Backspace sending DEL, 0x7f, against an ERASE of ^H is the common case): the
+    line discipline erases nothing and hands the program every byte typed. The
+    value looks right on screen and is wrong in the config, and for a *path* it
+    is quietly destructive — a leading run of DELs makes an absolute path
+    relative, so the run lands in <cwd>/<junk>/<the path you typed> instead.
+    Replay the edits the user meant, then drop whatever is still unprintable.
+    """
+    out: list[str] = []
+    for ch in _ANSI_RE.sub("", raw):
+        if ch in ("\x7f", "\x08"):      # DEL / Backspace: erase one character
+            if out:
+                out.pop()
+        elif ch == "\x15":              # ^U: kill the line
+            out.clear()
+        elif ch == "\x17":              # ^W: kill the previous word
+            while out and out[-1].isspace():
+                out.pop()
+            while out and not out[-1].isspace():
+                out.pop()
+        elif ch.isprintable():
+            out.append(ch)
+    return "".join(out)
+
+
+def _sanitize_loaded(value: Any) -> Any:
+    """Recursively apply sanitize_text() to every string in a loaded config.
+
+    Keys are left alone: they come from EDITABLE_FIELDS, never from typed text,
+    and rewriting them could silently collide two entries into one.
+    """
+    if isinstance(value, dict):
+        return {key: _sanitize_loaded(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_loaded(val) for val in value]
+    if isinstance(value, str):
+        return sanitize_text(value)
+    return value
 
 # The full default config. Anything not overridden falls back to this.
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -128,13 +177,18 @@ def _diff_overrides(base: dict[str, Any], current: dict[str, Any]) -> dict[str, 
 
 
 def load_overrides(path: Path = CONFIG_PATH) -> dict[str, Any]:
-    """Load the override-only JSON file, or an empty dict if none exists."""
+    """Load the override-only JSON file, or an empty dict if none exists.
+
+    Values are sanitized on the way in, so a config already saved with control
+    characters in it (see sanitize_text) yields the value the user meant rather
+    than the one that got typed. override_notice() reports when that happened.
+    """
     if not path.exists():
         return {}
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
+        return _sanitize_loaded(data) if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
 
@@ -160,6 +214,27 @@ def override_error(path: Path = CONFIG_PATH) -> str | None:
     if not isinstance(data, dict):
         return f"{where} must contain a JSON object; every override was ignored."
     return None
+
+
+def override_notice(path: Path = CONFIG_PATH) -> str | None:
+    """Return a message if the saved overrides hold control characters.
+
+    load_overrides() repairs them for the run, but the file keeps the junk until
+    it is re-saved — and quietly changing a value the user believes is stored is
+    the same trap as quietly ignoring it. Returns None when nothing was altered.
+    """
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None  # override_error() already reports an unusable file
+    if not isinstance(data, dict) or _sanitize_loaded(data) == data:
+        return None
+    return (f"{path.resolve()} contains terminal control characters (stray "
+            f"Backspace/arrow keys captured while typing a value). They are "
+            f"being ignored for this run — re-save the config to clear them.")
 
 
 def load_config(use_custom: bool, path: Path = CONFIG_PATH) -> dict[str, Any]:

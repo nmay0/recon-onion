@@ -28,10 +28,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from rich.console import Console
-from rich.prompt import Confirm
 
 from . import report, tools
 from .output import make_run_dir, print_summary, print_tool_block
+from .prompts import confirm
 from .tools import Port, ToolResult, ToolRun
 
 # Hard ceiling on recursive gobuster scans per host: a safety net independent of
@@ -704,7 +704,7 @@ def _drive_recursion(
         if is_fp:
             console.print(f"  [dim]skip {disp} — {note}[/dim]")
             continue
-        if mode == "prompt" and not Confirm.ask(
+        if mode == "prompt" and not confirm(
                 f"  Recurse into [bold]{disp}[/bold]?", default=False):
             continue
         stats["scans"] += 1
