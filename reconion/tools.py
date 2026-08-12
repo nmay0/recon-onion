@@ -792,7 +792,7 @@ _BLANKET_STATUS = GOBUSTER_INTERESTING - {200, 204}
 # Filter/match flags a user might set in a tool's extra flags; if any are
 # present we leave calibration off and respect the explicit choice.
 _GOBUSTER_FILTER_FLAGS = {"-b", "--status-codes-blacklist", "-s",
-                          "--status-codes", "--exclude-length", "--wildcard"}
+                          "--status-codes", "--exclude-length", "-xl"}
 _FFUF_FILTER_FLAGS = {"-fc", "-fs", "-fl", "-fw", "-fr", "-ac", "-acc", "-ach",
                       "-mc", "-ms", "-ml", "-mw", "-mr"}
 
@@ -816,9 +816,11 @@ class Calibration:
 
     def gobuster_args(self) -> list[str]:
         if self.kind == "size":
-            # --wildcard stops gobuster aborting on its own wildcard check; the
-            # exclude-length then drops the catch-all responses from the results.
-            return ["--wildcard", "--exclude-length", str(self.size)]
+            # exclude-length both drops the catch-all responses from the results
+            # and satisfies gobuster's own wildcard precheck (it returns early
+            # when the wildcard length is excluded), so the run doesn't abort.
+            # NB there is no --wildcard in dir mode -- it exists only in dns.
+            return ["--exclude-length", str(self.size)]
         if self.kind == "status":
             return ["-b", f"404,{self.status}"]
         return []
