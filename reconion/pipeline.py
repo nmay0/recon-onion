@@ -21,6 +21,7 @@ caller; the parallelism here is *within* a single host.
 
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,7 +30,7 @@ from typing import Any, Callable
 
 from rich.console import Console
 
-from . import report, tools
+from . import db, report, tools
 from .output import make_run_dir, print_summary, print_tool_block
 from .prompts import confirm
 from .tools import Port, ToolResult, ToolRun
@@ -413,7 +414,38 @@ def run_host(
         run_dir, document, result.tool_runs, config.get("output_formats", {}))
     if written:
         console.print(f"[dim]Reports: {', '.join(written)}[/dim]")
+
+    _record_in_database(console, document, config, run_dir, result)
     return result
+
+
+def _record_in_database(console: Console, document: dict[str, Any],
+                        config: dict[str, Any], run_dir: Path,
+                        result: HostResult) -> None:
+    """Persist the run into the findings database (best effort, never fatal).
+
+    The database is a convenience layered on top of the run: the artifacts and
+    reports are already on disk by now, so a storage problem must not take the
+    run down with it. It must not be silent either — a user who believes their
+    findings are being accumulated and finds an empty database later is worse
+    off than one who saw the error, so it goes to the console *and* into the
+    run's warnings, where the reports will show it.
+    """
+    enabled, db_file, workspace = db.database_settings(config)
+    if not enabled:
+        return
+    try:
+        counts = db.record_run(document, db_file=db_file, workspace=workspace,
+                               run_dir=run_dir)
+    except (db.DatabaseError, sqlite3.Error, OSError) as exc:
+        result.errors.append(f"database: {exc}")
+        console.print(f"[red]! Database not updated ({db_file}): {exc}[/red]")
+        return
+    detail = ", ".join(f"{n} {name}" for name, n in counts.items() if n)
+    # Parentheses, not brackets: a workspace name in [square brackets] would be
+    # eaten as rich markup ("default" is a real style tag).
+    console.print(f"[dim]Database: {db_file} (workspace {workspace})"
+                  + (f" — {detail}" if detail else "") + "[/dim]")
 
 
 def _wordlist_ok(path: str, label: str, errors: list[str]) -> bool:

@@ -111,6 +111,8 @@ Menu:
   defaults are saved (to `./recon_config.json`).
 - **4. Modify run** — toggle which tools run this session. Session-only; never
   saved to config.
+- **5. Database** — browse everything past runs found (see
+  [Findings database](#findings-database)).
 
 ### Presets
 
@@ -206,6 +208,7 @@ your overrides** and missing keys fall back to defaults automatically.
 | `privileged_prefix` | empty (set to `sudo` to run `masscan` privileged) |
 | `web_ports` | `80 443 8080 8443` (assumed only when no port scan runs — see [Presets](#presets)) |
 | `dns.record_types` | `A AAAA NS SOA MX TXT CNAME` |
+| `database.enabled` / `database.path` / `database.workspace` | `true` / empty (= `<output_dir>/reconion.db`) / `default` |
 | `wordlists.dir` / `wordlists.ffuf` | `/usr/share/wordlists/dirb/common.txt` |
 | `wordlists.dns` / `wordlists.vhost` | seclists subdomains top-5000 |
 | `recursion.mode` / `recursion.max_depth` | `never` / `2` (see [Recursive enumeration](#recursive-enumeration)) |
@@ -262,3 +265,39 @@ Pick formats in **Edit config → `o`**; the choice is saved like any other conf
 override. Defaults: `summary`, `json`, and `markdown` on.
 
 Timestamped per run, so previous runs are never overwritten.
+
+## Findings database
+
+Artifacts and reports are frozen to one timestamped directory, which makes them
+useless for questions that span runs — *which of these boxes runs SSH?*, *was
+8080 open last week?*, *where did I see that subdomain?* So every run is also
+recorded into a SQLite database (`<output_dir>/reconion.db` by default), in the
+spirit of msfconsole's database. Browse it in **5. Database**:
+
+| Table | Holds |
+| --- | --- |
+| Hosts | every address scanned, its domain, and when it was first/last seen |
+| Services | open ports with service name and version |
+| Web paths | discovered paths, with status/size and whether they came from `gobuster`, `ffuf`, `robots.txt` or a sitemap |
+| Findings | `nuclei` results (severity-sorted) and `searchsploit` leads |
+| Virtual hosts | names pointing at the host, tagged by how they were found (manual, `gobuster vhost/dns`, TLS SAN) |
+| DNS records | forward records and PTR |
+| Notes | `whatweb` fingerprints, response headers, TLS certificates, whois, declared files — kept as JSON |
+| Runs | each run's target, duration, stages and artifact directory |
+
+Rows are **upserted on what they are**, not when they were seen: re-scanning a
+target updates `last_seen` in place rather than inserting a duplicate, while
+`first_seen` records when it originally turned up. So the tables always show
+current truth, and a new port appearing is visible as a new row rather than
+buried in a second copy of everything. Each row also records the run that last
+touched it, so anything can be traced back to the raw artifacts.
+
+Pick a host in the Hosts view to scope every other view to it. **Workspaces**
+keep unrelated engagements apart — everything lands in `default` unless you set
+`database.workspace`; switching workspaces in the menu affects browsing only.
+
+The database never holds credentials or extracted data: recon onion observes and
+never authenticates, so msf's `creds`/`loot` equivalents don't exist here. If
+writing to it fails the run is unaffected — the artifacts and reports are
+already on disk, and the error is reported rather than swallowed. Set
+`database.enabled` to `false` to turn the whole thing off.

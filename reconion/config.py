@@ -108,6 +108,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "web_ports": "80 443 8080 8443",
     # Root output directory; runs land under <output_dir>/<host>/<timestamp>/.
     "output_dir": "./recon",
+    # Persistent findings database (SQLite). Every run's distilled results are
+    # upserted into it so hosts/services/paths/findings accumulate across runs
+    # instead of being frozen in one timestamped directory. A blank path means
+    # <output_dir>/reconion.db, so the database travels with the engagement
+    # folder. workspace separates unrelated engagements (msfconsole's idea);
+    # enabled is a string because the config editor edits strings only.
+    "database": {
+        "enabled": "true",
+        "path": "",
+        "workspace": "default",
+    },
     # Extra flags appended per tool/stage (a single string each, split on spaces).
     "tool_flags": {
         "nmap_sweep": "",

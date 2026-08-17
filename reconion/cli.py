@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import json
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from . import hosts, tools
+from . import db, hosts, tools
 from .config import (
     CONFIG_PATH,
     DEFAULT_CONFIG,
@@ -42,6 +44,12 @@ class Session:
         self.target: str | None = None
         self.domain: str | None = None
         self.vhosts: list[str] = []
+        # Database browsing state: which file/workspace is being looked at and
+        # whether the views are scoped to one host. Resolved from the config on
+        # first use (see _db_context), then remembered for the session.
+        self.db_file: Path | None = None
+        self.db_workspace: str = db.DEFAULT_WORKSPACE
+        self.db_host: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -413,6 +421,9 @@ EDITABLE_FIELDS: list[tuple[str, list[str]]] = [
     ("nmap timing flag", ["nmap_timing"]),
     ("privileged prefix (e.g. sudo, for masscan)", ["privileged_prefix"]),
     ("output directory", ["output_dir"]),
+    ("database enabled (true/false)", ["database", "enabled"]),
+    ("database file (blank = <output dir>/reconion.db)", ["database", "path"]),
+    ("database workspace", ["database", "workspace"]),
     ("web ports assumed when no port scan runs", ["web_ports"]),
     ("dns record types", ["dns", "record_types"]),
     ("gobuster recursion mode (never/prompt/always)", ["recursion", "mode"]),
@@ -508,6 +519,290 @@ def modify_run_flow(console: Console, session: Session) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Database flow
+# --------------------------------------------------------------------------- #
+
+def _db_context(session: Session) -> tuple[Path, str]:
+    """Resolve which database file and workspace the browser is looking at.
+
+    Derived from the effective custom config (defaults when nothing is saved),
+    which is where a run would have written it. The resolved path is always
+    printed rather than assumed: a config saved under a different working
+    directory, or a run made with 'default' against a customised output_dir,
+    puts the database somewhere the user did not expect — and an empty table is
+    an ambiguous way to find that out. 'f' in the menu repoints it.
+    """
+    if session.db_file is None:
+        _, db_file, workspace = db.database_settings(load_config(True))
+        session.db_file, session.db_workspace = db_file, workspace
+    return session.db_file, session.db_workspace
+
+
+def _db_table(title: str, columns: list[tuple[str, str]],
+              rows: list[dict[str, Any]]) -> Table:
+    """Build a rich table from (header, key) pairs and a list of row dicts."""
+    table = Table(title=title, title_style="bold cyan", header_style="bold")
+    for header, _ in columns:
+        table.add_column(header, overflow="fold")
+    for row in rows:
+        table.add_row(*["" if row.get(key) is None else str(row.get(key))
+                        for _, key in columns])
+    return table
+
+
+def _db_show(console: Console, title: str, columns: list[tuple[str, str]],
+             rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        console.print(f"[yellow]No {title.lower()} recorded yet.[/yellow]")
+        return
+    console.print(_db_table(f"{title} ({len(rows)})", columns, rows))
+
+
+def _db_search(what: str) -> str | None:
+    raw = _ask(f"Search {what} (blank = all)", default="").strip()
+    return raw or None
+
+
+def _db_hosts_view(console: Console, session: Session,
+                   db_file: Path, workspace: str) -> None:
+    """List hosts and let one be picked as the scope for every other view."""
+    rows = db.list_hosts(db_file, workspace)
+    if not rows:
+        console.print("[yellow]No hosts recorded yet — run a scan first.[/yellow]")
+        return
+    table = Table(title=f"Hosts ({len(rows)})", title_style="bold cyan",
+                  header_style="bold")
+    table.add_column("#", justify="right")
+    for header in ("Address", "Domain", "Services", "Paths", "Vulns",
+                   "First seen", "Last seen"):
+        table.add_column(header, overflow="fold")
+    for i, row in enumerate(rows, start=1):
+        table.add_row(str(i), row["address"], row["domain"] or "",
+                      str(row["services"]), str(row["paths"]),
+                      str(row["vulns"]), row["first_seen"], row["last_seen"])
+    console.print(table)
+    raw = _ask("Scope every view to host # ([bold]0[/bold] = all hosts, "
+               "[bold]Enter[/bold] = leave as is)", default="").strip()
+    if not raw:
+        return
+    if raw == "0":
+        session.db_host = None
+        console.print("[green]Scope cleared — showing all hosts.[/green]")
+        return
+    if raw.isdigit() and 1 <= int(raw) <= len(rows):
+        session.db_host = rows[int(raw) - 1]["address"]
+        console.print(f"[green]Scoped to {session.db_host}.[/green]")
+    else:
+        console.print("[yellow]Invalid selection; scope unchanged.[/yellow]")
+
+
+def _db_workspaces_view(console: Console, session: Session,
+                        db_file: Path) -> None:
+    rows = db.list_workspaces(db_file)
+    table = Table(title="Workspaces", title_style="bold cyan",
+                  header_style="bold")
+    table.add_column("#", justify="right")
+    for header in ("Name", "Hosts", "Runs", "Created"):
+        table.add_column(header, overflow="fold")
+    for i, row in enumerate(rows, start=1):
+        active = (" [green](current)[/green]"
+                  if row["name"] == session.db_workspace else "")
+        table.add_row(str(i), row["name"] + active, str(row["hosts"]),
+                      str(row["runs"]), row["created_at"])
+    console.print(table)
+    console.print("[dim]Switching here affects browsing only. Runs write to "
+                  "the workspace in the config (Edit config).[/dim]")
+    raw = _ask("Switch to workspace # , [bold]n[/bold]=new, "
+               "[bold]Enter[/bold]=back", default="").strip().lower()
+    if not raw:
+        return
+    if raw == "n":
+        name = _ask("New workspace name", default="").strip()
+        if not name:
+            return
+        db.create_workspace(db_file, name)
+        session.db_workspace, session.db_host = name, None
+        console.print(f"[green]Created and switched to '{name}'.[/green]")
+        return
+    if raw.isdigit() and 1 <= int(raw) <= len(rows):
+        session.db_workspace = rows[int(raw) - 1]["name"]
+        session.db_host = None
+        console.print(f"[green]Now browsing '{session.db_workspace}'.[/green]")
+    else:
+        console.print("[yellow]Invalid selection.[/yellow]")
+
+
+def _db_delete_view(console: Console, session: Session, db_file: Path,
+                    workspace: str) -> None:
+    """Delete a host (with everything hanging off it) or a whole workspace."""
+    what = _ask("Delete [bold]h[/bold]=a host, [bold]w[/bold]=a workspace, "
+                "[bold]Enter[/bold]=cancel",
+                default="").strip().lower()
+    if what == "h":
+        rows = db.list_hosts(db_file, workspace)
+        if not rows:
+            console.print("[yellow]Nothing to delete.[/yellow]")
+            return
+        _db_show(console, "Hosts",
+                 [("Address", "address"), ("Services", "services"),
+                  ("Paths", "paths"), ("Vulns", "vulns")], rows)
+        address = _ask("Address to delete (blank = cancel)", default="").strip()
+        if not address:
+            return
+        if address not in [r["address"] for r in rows]:
+            console.print("[yellow]No such host in this workspace.[/yellow]")
+            return
+        if not _confirm(f"Delete {address} and all its services, paths, "
+                        f"findings and notes?", default=False):
+            return
+        db.delete_host(db_file, workspace, address)
+        if session.db_host == address:
+            session.db_host = None
+        console.print(f"[green]Deleted {address}.[/green]")
+    elif what == "w":
+        name = _ask("Workspace to delete (blank = cancel)", default="").strip()
+        if not name:
+            return
+        stats = db.workspace_stats(db_file, name)
+        if not _confirm(f"Delete workspace '{name}' with its "
+                        f"{stats['hosts']} host(s) and {stats['runs']} run(s)?",
+                        default=False):
+            return
+        db.delete_workspace(db_file, name)
+        if session.db_workspace == name:
+            session.db_workspace, session.db_host = db.DEFAULT_WORKSPACE, None
+        console.print(f"[green]Deleted workspace '{name}'.[/green]")
+
+
+_DB_ACTIONS = {
+    "1": "Hosts (and pick the host to scope to)",
+    "2": "Services",
+    "3": "Web paths",
+    "4": "Findings & exploit leads",
+    "5": "Virtual hosts & DNS records",
+    "6": "Notes (fingerprints, headers, certs, whois)",
+    "7": "Runs",
+    "8": "Workspaces",
+    "9": "Delete a host or workspace",
+    "f": "Point at a different database file",
+    "q": "Back to the main menu",
+}
+
+
+def db_flow(console: Console, session: Session) -> None:
+    db_file, _ = _db_context(session)
+    if not db.exists(db_file):
+        console.print(Panel(
+            f"No database at [bold]{db_file}[/bold] yet.\n"
+            "It is created by the first run with the database enabled "
+            "(Edit config → database). Use [cyan]f[/cyan] below if it lives "
+            "somewhere else.", border_style="yellow"))
+    while True:
+        db_file, workspace = session.db_file, session.db_workspace
+        scope = (f"host [bold]{session.db_host}[/bold]" if session.db_host
+                 else "all hosts")
+        console.print(Panel(
+            f"[bold]{db_file}[/bold]\nworkspace [bold]{workspace}[/bold] — "
+            f"showing {scope}", title="Database", title_align="left",
+            border_style="cyan"))
+        table = Table(show_header=False, box=None)
+        for key, label in _DB_ACTIONS.items():
+            table.add_row(f"[bold cyan]{key}[/bold cyan]", label)
+        console.print(table)
+        choice = _ask("Select", choices=list(_DB_ACTIONS), default="1")
+        if choice == "q":
+            return
+        if choice == "f":
+            raw = _ask("Database file", default=str(db_file)).strip()
+            if raw:
+                session.db_file = Path(raw).expanduser().resolve()
+                session.db_host = None
+            continue
+        # Every view reads the file, so a missing/unreadable database is
+        # reported once here instead of in each branch.
+        try:
+            _db_dispatch(console, session, choice, db_file, workspace)
+        except db.DatabaseError as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
+        except sqlite3.Error as exc:
+            console.print(f"[red]Database error: {exc}[/red]")
+
+
+def _db_dispatch(console: Console, session: Session, choice: str,
+                 db_file: Path, workspace: str) -> None:
+    host = session.db_host
+    if choice == "1":
+        _db_hosts_view(console, session, db_file, workspace)
+    elif choice == "2":
+        _db_show(console, "Services",
+                 [("Host", "host"), ("Port", "port"), ("Proto", "proto"),
+                  ("State", "state"), ("Service", "name"),
+                  ("Version", "version"), ("Last seen", "last_seen")],
+                 db.list_services(db_file, workspace, host,
+                                  _db_search("service, version or port")))
+    elif choice == "3":
+        _db_show(console, "Web paths",
+                 [("Host", "host"), ("Port", "port"), ("Vhost", "vhost"),
+                  ("Path", "path"), ("Status", "status"), ("Size", "length"),
+                  ("Redirect", "redirect"), ("Source", "source")],
+                 db.list_web_paths(db_file, workspace, host, _db_search("path")))
+    elif choice == "4":
+        _db_show(console, "Findings & exploit leads",
+                 [("Host", "host"), ("Port", "port"), ("Severity", "severity"),
+                  ("Name", "name"), ("Source", "source"), ("URL", "url")],
+                 db.list_vulns(db_file, workspace, host,
+                               _db_search("finding name or template")))
+    elif choice == "5":
+        _db_show(console, "Virtual hosts",
+                 [("Host", "host"), ("Name", "name"), ("Source", "source"),
+                  ("First seen", "first_seen")],
+                 db.list_vhosts(db_file, workspace, host))
+        _db_show(console, "DNS records",
+                 [("Host", "host"), ("Name", "name"), ("Type", "rtype"),
+                  ("Value", "value")],
+                 db.list_dns_records(db_file, workspace, host))
+    elif choice == "6":
+        rows = db.list_notes(db_file, workspace, host)
+        for row in rows:  # the payload is JSON; show a readable slice of it
+            row["preview"] = _json_preview(row.get("data", ""))
+        _db_show(console, "Notes",
+                 [("Host", "host"), ("Port", "port"), ("Vhost", "vhost"),
+                  ("Type", "ntype"), ("Content", "preview"),
+                  ("Last seen", "last_seen")], rows)
+    elif choice == "7":
+        _db_show(console, "Runs",
+                 [("#", "id"), ("Target", "target"), ("Started", "started"),
+                  ("Seconds", "duration_seconds"), ("Stages", "stages"),
+                  ("Artifacts", "run_dir")],
+                 db.list_runs(db_file, workspace, host))
+    elif choice == "8":
+        _db_workspaces_view(console, session, db_file)
+    elif choice == "9":
+        _db_delete_view(console, session, db_file, workspace)
+
+
+_NOTE_PREVIEW_CHARS = 300
+
+
+def _json_preview(data: str) -> str:
+    """Flatten a note's JSON payload into one readable, truncated line."""
+    try:
+        parsed = json.loads(data)
+    except (json.JSONDecodeError, ValueError):
+        return data[:_NOTE_PREVIEW_CHARS]
+    def flat(value: Any) -> str:
+        if isinstance(value, list):
+            return ", ".join(flat(v) for v in value)
+        if isinstance(value, dict):
+            return "; ".join(f"{k}={flat(v)}" for k, v in value.items() if v)
+        return str(value)
+
+    text = flat(parsed)
+    return (text[:_NOTE_PREVIEW_CHARS] + "…"
+            if len(text) > _NOTE_PREVIEW_CHARS else text)
+
+
+# --------------------------------------------------------------------------- #
 # Main menu
 # --------------------------------------------------------------------------- #
 
@@ -534,7 +829,8 @@ def main() -> None:
         "2": "Preset (pick which stages run)",
         "3": "Edit config",
         "4": "Modify run (session toggles)",
-        "5": "Quit",
+        "5": "Database (findings kept across runs)",
+        "6": "Quit",
     }
     while True:
         console.print()
@@ -554,5 +850,7 @@ def main() -> None:
         elif choice == "4":
             modify_run_flow(console, session)
         elif choice == "5":
+            db_flow(console, session)
+        elif choice == "6":
             console.print("Bye.")
             return
