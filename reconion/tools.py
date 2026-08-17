@@ -969,6 +969,52 @@ def _user_filters_present(extra: str, flags: set[str]) -> bool:
     return False
 
 
+# gobuster runs its own catch-all precheck before the scan and aborts when the
+# server answers a random path with something our filters don't already exclude:
+#   "the server returns a status code that matches the provided options for non
+#    existing urls. http://x/<uuid> => 200 (Length: 1234). To continue please
+#    exclude the status code or the length"
+# The "=> <status> (Length: <n>)" shape has been stable across gobuster 3.x, and
+# it hands us the exact sample its precheck measured.
+_WILDCARD_ABORT_RE = re.compile(r"=>\s*(\d{3})\s*\(\s*Length:\s*(\d+)\s*\)",
+                                re.IGNORECASE)
+
+
+def parse_wildcard_abort(result: ToolResult) -> tuple[int, int] | None:
+    """Extract (status, length) from a gobuster wildcard-abort failure.
+
+    Returns None unless the run actually failed with that message, so a healthy
+    (or missing/timed-out) run is never mistaken for a catch-all.
+    """
+    if result.skipped or result.error or result.returncode == 0:
+        return None
+    match = _WILDCARD_ABORT_RE.search(f"{result.stderr}\n{result.stdout}")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def wildcard_retry_args(status: int, length: int) -> tuple[list[str], str]:
+    """Filter flags that let a wildcard-aborted gobuster dir run proceed.
+
+    Rescue path for when our own calibration probe declined to filter (a
+    high-value 200/204 catch-all) or measured a different size than gobuster's
+    precheck did: rather than losing the whole stage we reuse gobuster's own
+    sample. Size-first like _decide_calibration -- excluding one exact length is
+    surgical, and gobuster probes a fixed-length UUID path so its wildcard length
+    is stable across attempts. Only when the catch-all body is empty (a bare
+    redirect/403) do we fall back to blacklisting the status, and never for
+    200/204, which would hide real pages.
+    """
+    if length > 0 or status in (200, 204):
+        return (["--exclude-length", str(length)],
+                f"gobuster aborted on its catch-all precheck (HTTP {status}, "
+                f"length {length}); retried excluding length {length}")
+    return (["-b", f"404,{status}"],
+            f"gobuster aborted on its catch-all precheck (HTTP {status}, empty "
+            f"body); retried excluding status {status}")
+
+
 def gobuster_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
                  insecure: bool, host_header: str | None = None,
                  calibrate: bool = False) -> ToolResult:
@@ -979,14 +1025,29 @@ def gobuster_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
         # Target the IP but route to the right virtual host via the Host header,
         # so no /etc/hosts entry is required.
         command += ["-H", f"Host: {host_header}"]
+    tail = flag_list(extra)
+    filters: list[str] = []
     note = ""
-    if (calibrate and tool_available("gobuster")
-            and not _user_filters_present(extra, _GOBUSTER_FILTER_FLAGS)):
+    # Both the pre-scan probe and the post-abort retry inject filter flags, so
+    # both back off when the user set filters of their own.
+    tunable = calibrate and not _user_filters_present(extra,
+                                                      _GOBUSTER_FILTER_FLAGS)
+    if tunable and tool_available("gobuster"):
         cal = calibrate_web(url, host_header=host_header)
-        command += cal.gobuster_args()
+        filters = cal.gobuster_args()
         note = cal.note
-    command += flag_list(extra)
-    return _run("gobuster_dir", command, artifact, note=note)
+    result = _run("gobuster_dir", command + filters + tail, artifact, note=note)
+    if tunable:
+        abort = parse_wildcard_abort(result)
+        if abort:
+            # One retry only: gobuster's precheck length is stable, so a second
+            # abort means the filter genuinely doesn't fit and looping wouldn't
+            # help. The retry rewrites the artifact; the note keeps the trail.
+            retry_filters, why = wildcard_retry_args(*abort)
+            note = f"{note}; {why}" if note else why
+            result = _run("gobuster_dir", command + retry_filters + tail,
+                          artifact, note=note)
+    return result
 
 
 def ffuf_dir(url: str, wordlist: str, artifact: Path, *, extra: str,
