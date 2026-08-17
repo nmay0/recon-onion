@@ -330,9 +330,15 @@ def record_run(doc: dict[str, Any], *, db_file: Path, workspace: str,
         if not address:
             raise DatabaseError("run document has no target to record")
 
+        # Only a run that learned a domain writes one. The domain is prompted
+        # for solely when a DNS stage is on (dig/gobuster_dns/gobuster_vhost),
+        # so a later fuzz-only run — or an Enter at the prompt — would other-
+        # wise write NULL over the domain an earlier run recorded, which is the
+        # one way this schema loses what it has already seen.
+        domain = str(scan.get("domain") or "").strip()
         _upsert(conn, "hosts", "workspace_id, address",
                 {"workspace_id": ws_id, "address": address},
-                {"domain": scan.get("domain")}, now, None)
+                {"domain": domain} if domain else {}, now, None)
         host_id = _lookup_id(conn, "hosts",
                              {"workspace_id": ws_id, "address": address})
 

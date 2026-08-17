@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -538,6 +539,19 @@ def _db_context(session: Session) -> tuple[Path, str]:
     return session.db_file, session.db_workspace
 
 
+def _cell(value: Any) -> str:
+    """Render a database value as a table cell rich will not read as markup.
+
+    Every cell here is scan output, and square brackets are everywhere in it:
+    whatweb reports ``HTTPServer[nginx/1.18.0], Title[Index of /]``. Unescaped,
+    rich drops each bracket group as an unknown style tag — the version data,
+    which is the whole point of the note — and a redirect such as
+    ``RedirectLocation[/login]`` reads as a closing tag with nothing open,
+    raising MarkupError out of the browser and off the top of the CLI.
+    """
+    return "" if value is None else escape(str(value))
+
+
 def _db_table(title: str, columns: list[tuple[str, str]],
               rows: list[dict[str, Any]]) -> Table:
     """Build a rich table from (header, key) pairs and a list of row dicts."""
@@ -545,8 +559,7 @@ def _db_table(title: str, columns: list[tuple[str, str]],
     for header, _ in columns:
         table.add_column(header, overflow="fold")
     for row in rows:
-        table.add_row(*["" if row.get(key) is None else str(row.get(key))
-                        for _, key in columns])
+        table.add_row(*[_cell(row.get(key)) for _, key in columns])
     return table
 
 
@@ -577,9 +590,10 @@ def _db_hosts_view(console: Console, session: Session,
                    "First seen", "Last seen"):
         table.add_column(header, overflow="fold")
     for i, row in enumerate(rows, start=1):
-        table.add_row(str(i), row["address"], row["domain"] or "",
-                      str(row["services"]), str(row["paths"]),
-                      str(row["vulns"]), row["first_seen"], row["last_seen"])
+        table.add_row(str(i), _cell(row["address"]), _cell(row["domain"]),
+                      _cell(row["services"]), _cell(row["paths"]),
+                      _cell(row["vulns"]), _cell(row["first_seen"]),
+                      _cell(row["last_seen"]))
     console.print(table)
     raw = _ask("Scope every view to host # ([bold]0[/bold] = all hosts, "
                "[bold]Enter[/bold] = leave as is)", default="").strip()
@@ -607,8 +621,8 @@ def _db_workspaces_view(console: Console, session: Session,
     for i, row in enumerate(rows, start=1):
         active = (" [green](current)[/green]"
                   if row["name"] == session.db_workspace else "")
-        table.add_row(str(i), row["name"] + active, str(row["hosts"]),
-                      str(row["runs"]), row["created_at"])
+        table.add_row(str(i), _cell(row["name"]) + active, _cell(row["hosts"]),
+                      _cell(row["runs"]), _cell(row["created_at"]))
     console.print(table)
     console.print("[dim]Switching here affects browsing only. Runs write to "
                   "the workspace in the config (Edit config).[/dim]")
